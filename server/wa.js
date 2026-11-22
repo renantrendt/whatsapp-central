@@ -183,6 +183,14 @@ export class WaAccount {
           for (const u of updates) await this.onMessageUpdate(u)
         })
       )
+      // Ligação chegando: o app do Mac abre a janela de ligações desse número.
+      sock.ev.on('call', (list) => {
+        for (const c of list || []) {
+          if (c.status === 'offer') {
+            this.hub.events.emit('event', { type: 'call', account: this.id, video: !!c.isVideo, group: !!c.isGroup })
+          }
+        }
+      })
       sock.ev.on('messages.reaction', (list) =>
         this.enqueue(async () => {
           for (const r of list) await this.onReaction(r.key, r.reaction)
@@ -519,6 +527,18 @@ export class WaAccount {
 
   jidFor(chatId) {
     return this.store.getChat(this.id, chatId)?.send_jid || chatId
+  }
+
+  // Número de telefone (só dígitos) de uma conversa individual, para abrir no WhatsApp Web.
+  async phoneFor(chatId) {
+    for (const j of [chatId, this.jidFor(chatId)]) {
+      if (j.endsWith('@s.whatsapp.net')) return j.split('@')[0].split(':')[0]
+      if (j.endsWith('@lid')) {
+        const pn = await this.sock?.signalRepository?.lidMapping?.getPNForLID(j).catch(() => null)
+        if (pn) return pn.split('@')[0].split(':')[0]
+      }
+    }
+    return null
   }
 
   mediaPath(msgId, mime) {

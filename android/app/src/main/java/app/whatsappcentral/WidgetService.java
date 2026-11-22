@@ -8,7 +8,9 @@ import android.graphics.BitmapShader;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Shader;
+import android.appwidget.AppWidgetManager;
 import android.net.Uri;
+import android.text.format.DateUtils;
 import android.view.View;
 import android.widget.RemoteViews;
 import android.widget.RemoteViewsService;
@@ -24,17 +26,22 @@ import java.util.Map;
 public class WidgetService extends RemoteViewsService {
     @Override
     public RemoteViewsFactory onGetViewFactory(Intent intent) {
-        return new Factory(getApplicationContext());
+        int widgetId = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, 0);
+        return new Factory(getApplicationContext(), widgetId);
     }
 
     static class Factory implements RemoteViewsFactory {
         private final Context ctx;
+        private final int widgetId;
+        private boolean notesTab = false;
         private List<UnreadWidget.Item> items = new ArrayList<>();
+        private List<UnreadWidget.Note> notes = new ArrayList<>();
         /** Fotos já baixadas, pela chave da conversa + versão da foto. */
         private final Map<String, Bitmap> photos = new HashMap<>();
 
-        Factory(Context ctx) {
+        Factory(Context ctx, int widgetId) {
             this.ctx = ctx;
+            this.widgetId = widgetId;
         }
 
         @Override
@@ -44,6 +51,11 @@ public class WidgetService extends RemoteViewsService {
         @Override
         public void onDataSetChanged() {
             // Roda fora da linha principal: pode ler o servidor e baixar as fotos.
+            notesTab = UnreadWidget.TAB_NOTES.equals(UnreadWidget.tabOf(ctx, widgetId));
+            if (notesTab) {
+                notes = UnreadWidget.loadNotes();
+                return;
+            }
             items = UnreadWidget.loadUnread();
             for (UnreadWidget.Item it : items) {
                 String k = it.key + "#" + it.avatar;
@@ -76,8 +88,33 @@ public class WidgetService extends RemoteViewsService {
             return out;
         }
 
+        // Linha 0: as abas. Depois, as conversas ou as notas (ou um aviso de lista vazia).
+        private int contentCount() {
+            return notesTab ? notes.size() : items.size();
+        }
+
+        private RemoteViews tabsView() {
+            RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget_tabs_row);
+            v.setTextColor(R.id.tab_inbox, notesTab ? 0xFF6F6C66 : 0xFFFFFFFF);
+            v.setTextColor(R.id.tab_notes, notesTab ? 0xFFFFFFFF : 0xFF6F6C66);
+            v.setInt(R.id.tab_inbox, "setBackgroundResource", notesTab ? R.drawable.tab_off : R.drawable.tab_on);
+            v.setInt(R.id.tab_notes, "setBackgroundResource", notesTab ? R.drawable.tab_on : R.drawable.tab_off);
+            v.setOnClickFillInIntent(R.id.tab_inbox, new Intent().putExtra("tab", UnreadWidget.TAB_INBOX));
+            v.setOnClickFillInIntent(R.id.tab_notes, new Intent().putExtra("tab", UnreadWidget.TAB_NOTES));
+            return v;
+        }
+
         @Override
         public RemoteViews getViewAt(int position) {
+            if (position == 0) return tabsView();
+            if (contentCount() == 0) {
+                RemoteViews e = new RemoteViews(ctx.getPackageName(), R.layout.widget_empty_row);
+                e.setTextViewText(R.id.row, notesTab ? "No notes yet" : "No conversations yet");
+                e.setOnClickFillInIntent(R.id.row, new Intent());
+                return e;
+            }
+            position -= 1;
+            if (notesTab) return noteView(position);
             RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget_row);
             if (position >= items.size()) return v;
             UnreadWidget.Item it = items.get(position);
@@ -98,9 +135,23 @@ public class WidgetService extends RemoteViewsService {
             return v;
         }
 
+        private RemoteViews noteView(int position) {
+            RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget_note_row);
+            if (position >= notes.size()) return v;
+            UnreadWidget.Note n = notes.get(position);
+            v.setTextViewText(R.id.name, n.title);
+            v.setTextViewText(R.id.text, n.summary);
+            long ms = n.updated * 1000;
+            v.setTextViewText(R.id.time, DateUtils.isToday(ms)
+                    ? DateUtils.formatDateTime(ctx, ms, DateUtils.FORMAT_SHOW_TIME)
+                    : DateUtils.formatDateTime(ctx, ms, DateUtils.FORMAT_SHOW_DATE | DateUtils.FORMAT_ABBREV_MONTH | DateUtils.FORMAT_NO_YEAR));
+            v.setOnClickFillInIntent(R.id.row, new Intent().putExtra("note", n.id));
+            return v;
+        }
+
         @Override
         public int getCount() {
-            return items.size();
+            return 1 + Math.max(1, contentCount());
         }
 
         @Override
@@ -110,11 +161,15 @@ public class WidgetService extends RemoteViewsService {
 
         @Override
         public int getViewTypeCount() {
-            return 1;
+            return 4; // abas, conversa, nota e lista vazia
         }
 
         @Override
         public long getItemId(int position) {
+            if (position == 0) return Long.MIN_VALUE;
+            if (contentCount() == 0) return Long.MIN_VALUE + 1;
+            position -= 1;
+            if (notesTab) return position < notes.size() ? -notes.get(position).id - 1 : position;
             return position < items.size() ? items.get(position).key.hashCode() : position;
         }
 

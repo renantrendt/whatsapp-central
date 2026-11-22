@@ -161,6 +161,12 @@ function renderDialog() {
         re.onclick = () => api('/api/connect', { account: a.id }).catch(alertError)
         row.append(re)
       }
+      if (state.calls && a.status === 'open') {
+        const call = el('button', null, 'Calls')
+        call.title = 'Open the calls window for this number (scan its QR code the first time)'
+        call.onclick = () => api('/api/calls/setup', { account: a.id }).catch(alertError)
+        row.append(call)
+      }
       const out = el('button', 'danger', 'Disconnect')
       out.onclick = async () => {
         if (!confirm(`Disconnect ${a.me || 'this account'} from this Mac? Its conversations are removed from this app. Nothing is deleted on the phone.`)) return
@@ -463,6 +469,7 @@ function renderChatHead() {
   if (state.accounts.length > 1) parts.push(`via ${accountOf(c.account)?.me || 'offline account'}`)
   if (c.archived) parts.push('Archived')
   $('chat-sub').textContent = parts.join(' - ')
+  $('chat-call').hidden = !state.calls
 }
 
 const mediaUrl = (m) =>
@@ -847,6 +854,18 @@ async function computeWaveform(blob) {
   }
 }
 
+// Ligar: abre a conversa na janela de ligações (WhatsApp Web) deste número.
+$('chat-call').onclick = async () => {
+  const c = state.chats.get(state.selected)
+  if (!c) return
+  try {
+    const r = await api('/api/call', { account: c.account, chat: c.id })
+    if (!r.phone) alert('The calls window is open. Find this conversation there and tap the call button.')
+  } catch (e) {
+    alertError(e)
+  }
+}
+
 $('mic').onclick = startRecording
 $('rec-cancel').onclick = () => stopRecording(true)
 $('rec-send').onclick = () => stopRecording(false)
@@ -983,6 +1002,7 @@ async function load() {
   const s = await api('/api/state')
   state.accounts = s.accounts
   state.demo = s.demo
+  state.calls = !!s.calls // ligações: só no app do Mac
   state.chats = new Map(s.chats.map((c) => [keyOf(c), c]))
   if (state.selected && !state.chats.has(state.selected)) closeChat()
   renderEmpty()
@@ -1598,7 +1618,13 @@ function openChatKey(k) {
   if (state.tab !== tab) document.querySelector(`#tabs button[data-tab="${tab}"]`).click()
   openChat(k)
 }
-Object.assign(window.wc, { back, openChatKey })
+// Aberto pelo widget: vai direto para a nota.
+function openNoteId(id) {
+  if (!state.notes.some((n) => n.id === id)) return
+  if (state.tab !== 'notes') document.querySelector('#tabs button[data-tab="notes"]').click()
+  openNote(id)
+}
+Object.assign(window.wc, { back, openChatKey, openNoteId })
 window.wc.newNote = newNote
 
 loadNotes().then(load).then(listen).catch((e) => {

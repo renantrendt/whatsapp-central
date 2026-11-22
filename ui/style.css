@@ -310,3 +310,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 
 .msg .text a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }
+
+.chat-title { flex: 1; min-width: 0; }
+#chat-call { color: var(--muted); width: 38px; height: 38px; }
+#chat-call:hover { color: var(--text); }
+#chat-call[hidden] { display: none; }

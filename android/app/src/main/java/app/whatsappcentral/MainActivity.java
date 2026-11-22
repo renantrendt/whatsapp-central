@@ -32,6 +32,7 @@ import java.net.HttpURLConnection;
 public class MainActivity extends Activity {
     private WebView web;
     private String pendingChat;
+    private long pendingNote = 0;
     private boolean loaded = false;
     private PermissionRequest pendingMic;
     private ValueCallback<Uri[]> pendingFiles;
@@ -179,6 +180,8 @@ public class MainActivity extends Activity {
     private void handleIntent(Intent intent) {
         String chat = intent == null ? null : intent.getStringExtra("chat");
         if (chat != null) pendingChat = chat;
+        long note = intent == null ? 0 : intent.getLongExtra("note", 0);
+        if (note > 0) pendingNote = note;
         if (intent != null && intent.getBooleanExtra("pinWidget", false)) pinWidget();
     }
 
@@ -193,6 +196,11 @@ public class MainActivity extends Activity {
     }
 
     private void openPendingChat() {
+        if (pendingNote > 0) {
+            String js = "setTimeout(() => window.wc && wc.openNoteId(" + pendingNote + "), 600)";
+            pendingNote = 0;
+            web.evaluateJavascript(js, null);
+        }
         if (pendingChat == null) return;
         String js = "setTimeout(() => window.wc && wc.openChatKey(" + JSONObject.quote(pendingChat) + "), 600)";
         pendingChat = null;

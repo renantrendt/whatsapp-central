@@ -19,13 +19,14 @@ The rule I care about most: archived chats stay out of sight. When a new message
 - **Keyboard first.** `E` archives the open chat and opens the next one. `↑` and `↓` move between chats. `⌘K` finds any chat, archived or not.
 - **Messages.** Read and send text. Photos, videos, stickers, documents and voice messages play inside the app. Old media that WhatsApp no longer stores is requested again from your phone.
 - **Send photos and voice messages.** Pick, paste or drag a photo, with an optional caption. Record a voice message with the microphone button; the app converts the recording to OGG/Opus, the format WhatsApp uses for voice messages.
+- **Calls on the Mac.** Each number can have a calls window with the official WhatsApp Web (the same idea Volt uses). It stays open in the background, comes to the front when a call arrives, and the phone button in a conversation opens that contact there.
 - **Clickable links.** `https://…`, `www.…` and plain addresses like `example.com.br` become links when the ending is a real domain ending from the [IANA list](https://data.iana.org/TLD/tlds-alpha-by-domain.txt).
 - **Reactions.** See reactions and react with one click.
 - **Profile photos**, cached on your Mac and checked again every 7 days.
 - **Notes.** A third tab for your own notes, with bold text, bullet lists, numbered lists and to-do lists. Type `/` for the menu, or select text for a small format bar. `⌘N` creates a note.
 - **Unread count** on the Dock icon and macOS notifications for new messages.
 - **Resizable sidebar.** Drag its edge, or hide it with `⌘\`.
-- **Android app.** The same app runs on its own on an Android phone, with notifications and a home screen widget with your recent conversations (unread ones first).
+- **Android app.** The same app runs on its own on an Android phone, with notifications and a home screen widget with two tabs: Inbox (recent conversations, unread first) and Notes (each note in full).
 - **Notes sync.** Notes stay the same on the Mac and the phone, synced directly over [Tailscale](https://tailscale.com).
 
 | Find any chat with ⌘K | Notes with to-do lists |
@@ -108,7 +109,12 @@ Known limits:
 - Only phones with 64-bit ARM processors (almost all phones from 2019 on).
 - The Node engine from nodejs-mobile is not aligned to 16 KB memory pages. It runs on today's phones, but may not run on future phones that use only 16 KB pages.
 - The official WhatsApp app on the same phone also sends notifications. You may want to mute one of them.
-- After an update, open the app once: Android stops it during the update, and the widget and notifications only come back when it runs again.
+- The app starts again by itself after an update and after the phone restarts.
+- Calls stay in the official WhatsApp app on the phone.
+
+## Calls (Mac)
+
+To answer and make calls, open **Accounts > Calls** for a number and scan the QR code shown in its calls window. That window is the official WhatsApp Web, kept in its own session per number, with the microphone and camera allowed. It counts as one more linked device; WhatsApp allows four per number.
 
 ## Notes sync
 

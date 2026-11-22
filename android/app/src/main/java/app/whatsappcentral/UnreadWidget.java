@@ -21,10 +21,113 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Widget 4x2 da tela inicial com as conversas que têm mensagens não lidas.
- * Os dados vêm do servidor que roda dentro do app (o mesmo da tela).
+ * Widget 4x2 da tela inicial com duas abas: Inbox (conversas recentes, não lidas
+ * primeiro) e Notes (notas, a editada mais recentemente primeiro). Os dados vêm do
+ * servidor que roda dentro do app (o mesmo da tela).
  */
 public class UnreadWidget extends AppWidgetProvider {
+    static final String ACTION_TAB = "app.whatsappcentral.WIDGET_TAB";
+    static final String TAB_INBOX = "inbox";
+    static final String TAB_NOTES = "notes";
+
+    /** Aba escolhida em cada widget (cada widget lembra a sua). */
+    static String tabOf(Context ctx, int widgetId) {
+        return ctx.getSharedPreferences("widget", Context.MODE_PRIVATE).getString("tab" + widgetId, TAB_INBOX);
+    }
+
+    @Override
+    public void onReceive(Context ctx, Intent intent) {
+        super.onReceive(ctx, intent);
+    }
+
+    /** Uma nota, para a aba Notes. */
+    static class Note {
+        long id, updated;
+        String title, summary;
+    }
+
+    /** Lê as notas do servidor do app, a editada mais recentemente primeiro. */
+    static List<Note> loadNotes() {
+        List<Note> out = new ArrayList<>();
+        try {
+            HttpURLConnection c = NodeService.open("/api/notes");
+            c.setReadTimeout(10000);
+            String body;
+            try (InputStream in = c.getInputStream()) {
+                body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+            JSONArray notes = new JSONObject(body).getJSONArray("notes");
+            for (int i = 0; i < notes.length() && out.size() < 30; i++) {
+                JSONObject n = notes.getJSONObject(i);
+                Note it = new Note();
+                it.id = n.getLong("id");
+                it.updated = n.optLong("updated");
+                it.title = n.optString("title").trim().isEmpty() ? "Untitled" : n.optString("title").trim();
+                it.summary = toText(n.optString("body"));
+                out.add(it);
+            }
+        } catch (Exception ignored) {
+        }
+        out.sort((a, b) -> Long.compare(b.updated, a.updated));
+        return out;
+    }
+
+    /**
+     * A nota inteira em texto simples, para o widget: listas com "•", listas
+     * numeradas com "1.", tarefas com ☐ e ☑. Linhas vazias seguidas viram uma só.
+     */
+    static String toText(String html) {
+        StringBuilder out = new StringBuilder();
+        java.util.ArrayDeque<int[]> lists = new java.util.ArrayDeque<>(); // {tipo, contador}: 0 = •, 1 = número, 2 = tarefa
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("<(/?)([a-zA-Z0-9]+)([^>]*)>|([^<]+)").matcher(html == null ? "" : html);
+        while (m.find()) {
+            if (m.group(4) != null) {
+                out.append(m.group(4).replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">")
+                        .replace("&quot;", "\"").replace("&#39;", "'").replace("&amp;", "&"));
+                continue;
+            }
+            boolean close = !m.group(1).isEmpty();
+            String tag = m.group(2).toLowerCase();
+            String attrs = m.group(3);
+            switch (tag) {
+                case "ul":
+                case "ol":
+                    if (close) {
+                        if (!lists.isEmpty()) lists.pop();
+                    } else {
+                        int type = tag.equals("ol") ? 1 : attrs.contains("checklist") ? 2 : 0;
+                        lists.push(new int[]{type, 0});
+                    }
+                    newline(out);
+                    break;
+                case "li":
+                    if (close) break;
+                    newline(out);
+                    int[] list = lists.peek();
+                    for (int k = 1; k < lists.size(); k++) out.append("    ");
+                    if (list == null || list[0] == 0) out.append("• ");
+                    else if (list[0] == 1) out.append(++list[1]).append(". ");
+                    else out.append(attrs.contains("\"true\"") ? "☑ " : "☐ ");
+                    break;
+                case "br":
+                    out.append('\n');
+                    break;
+                case "div":
+                case "p":
+                    newline(out);
+                    break;
+                default:
+                    break;
+            }
+        }
+        String text = out.toString().replaceAll("[ \t]+\n", "\n").replaceAll("\n{3,}", "\n\n").trim();
+        return text.isEmpty() ? "Empty" : text;
+    }
+
+    private static void newline(StringBuilder out) {
+        if (out.length() > 0 && out.charAt(out.length() - 1) != '\n') out.append('\n');
+    }
 
     /** Uma conversa com mensagens não lidas. */
     static class Item {
@@ -92,33 +195,30 @@ public class UnreadWidget extends AppWidgetProvider {
         int[] ids = mgr.getAppWidgetIds(new ComponentName(app, UnreadWidget.class));
         if (ids.length == 0) return;
         new Thread(() -> {
-            List<Item> items = loadUnread();
-            int total = 0;
-            for (Item it : items) total += it.unread;
-            for (int id : ids) mgr.updateAppWidget(id, build(app, id, total));
+            for (int id : ids) {
+                String tab = tabOf(app, id);
+                mgr.updateAppWidget(id, build(app, id, tab));
+            }
             mgr.notifyAppWidgetViewDataChanged(ids, R.id.list);
         }, "widget").start();
     }
 
     @SuppressWarnings("deprecation")
-    private static RemoteViews build(Context ctx, int widgetId, int total) {
+    private static RemoteViews build(Context ctx, int widgetId, String tab) {
         RemoteViews v = new RemoteViews(ctx.getPackageName(), R.layout.widget);
-
         Intent svc = new Intent(ctx, WidgetService.class);
         svc.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
         svc.setData(Uri.parse(svc.toUri(Intent.URI_INTENT_SCHEME)));
         v.setRemoteAdapter(R.id.list, svc);
-        v.setEmptyView(R.id.list, R.id.empty);
-
-        // Tocar na área vazia abre o app.
-        Intent open = new Intent(ctx, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        PendingIntent openPi = PendingIntent.getActivity(ctx, 1, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        v.setOnClickPendingIntent(R.id.empty, openPi);
-
-        // Tocar numa conversa abre essa conversa (cada linha completa o "chat").
-        Intent row = new Intent(ctx, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        PendingIntent rowPi = PendingIntent.getActivity(ctx, 2, row, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
-        v.setPendingIntentTemplate(R.id.list, rowPi);
+        // Todo toque numa linha (aba, conversa ou nota) passa pela WidgetClickActivity.
+        Intent click = new Intent(ctx, WidgetClickActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId);
+        PendingIntent pi = PendingIntent.getActivity(ctx, 100 + widgetId, click,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+        v.setPendingIntentTemplate(R.id.list, pi);
         return v;
     }
+
+
 }

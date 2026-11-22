@@ -35,6 +35,7 @@ import { openStore } from './store.js'
 import { createHub, previewOf } from './hub.js'
 import { startSync } from './sync.js'
 import { webmToOgg } from './ogg.js'
+import { EventEmitter } from 'node:events'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const uiDir = path.join(here, '..', 'ui')
@@ -123,8 +124,15 @@ const TYPES = {
 }
 
 const sseClients = new Set()
+// Ponte com a janela do Mac (electron/main.cjs): pedidos para abrir a janela de
+// ligações (o WhatsApp Web oficial) de um número.
+export const calls = new EventEmitter()
+const callsAvailable = !!process.env.WC_CALLS
+const accountLabel = (id) => accounts.get(id)?.me || 'WhatsApp'
+
 hub.events.on('event', (ev) => {
   if (ev.type === 'chat' && !ev.chat.archived) accounts.get(ev.chat.account)?.wantAvatar(ev.chat.id)
+  if (ev.type === 'call') calls.emit('incoming', { account: ev.account, label: accountLabel(ev.account) })
   const line = `data: ${JSON.stringify(ev)}\n\n`
   for (const res of sseClients) res.write(line)
 })
@@ -245,7 +253,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/api/state') {
       const chats = hub.listChats()
       wantAvatars(chats)
-      return json(res, 200, { accounts: accountViews(), chats, demo })
+      return json(res, 200, { accounts: accountViews(), chats, demo, calls: callsAvailable })
     }
 
     if (req.method === 'GET' && p === '/api/notes') {
@@ -350,11 +358,13 @@ const server = http.createServer(async (req, res) => {
         const html = String(body.body || '').slice(0, 1_500_000)
         const note = store.saveNote(Number(body.id) || null, title, html)
         sync?.changed()
+        hub.events.emit('event', { type: 'notes-local' })
         return json(res, 200, { note })
       }
       if (p === '/api/notes/delete') {
         store.deleteNote(Number(body.id))
         sync?.changed()
+        hub.events.emit('event', { type: 'notes-local' })
         return json(res, 200, { ok: true })
       }
       if (p === '/api/sync/pair') {
@@ -370,6 +380,12 @@ const server = http.createServer(async (req, res) => {
       const acc = accounts.get(body.account)
       if (!acc) return json(res, 400, { error: 'unknown account' })
 
+      if (p === '/api/call' || p === '/api/calls/setup') {
+        if (!callsAvailable) return json(res, 400, { error: 'Calls are only available in the Mac app.' })
+        const phone = p === '/api/call' && body.chat ? await acc.phoneFor(String(body.chat)) : null
+        calls.emit('open', { account: acc.id, label: accountLabel(acc.id), phone })
+        return json(res, 200, { ok: true, phone: !!phone })
+      }
       if (p === '/api/connect') {
         // Trocar entre QR code e código por número reinicia a tentativa de ligação.
         if ('phone' in body) await acc.stop()

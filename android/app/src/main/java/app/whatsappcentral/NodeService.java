@@ -211,7 +211,7 @@ public class NodeService extends Service {
             UnreadWidget.refreshSoon(this);
             return;
         }
-        if (type.equals("reload") || type.equals("chat-removed")) {
+        if (type.equals("reload") || type.equals("chat-removed") || type.equals("notes") || type.equals("notes-local")) {
             UnreadWidget.refreshSoon(this);
             return;
         }
