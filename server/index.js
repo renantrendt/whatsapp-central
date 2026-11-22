@@ -98,6 +98,22 @@ if (store.version() < 2) {
 
 // Conversas sem foto são conferidas de novo a cada abertura (só as que aparecem na tela).
 if (!demo) store.db.prepare('UPDATE chats SET avatar_checked = 0 WHERE avatar = 0').run()
+// HD copies saved before the app learned to skip them (see isHdCopy in parse.js).
+// Only when the normal copy is saved too, so no photo or video disappears.
+if (!demo) {
+  const hasParent = store.db.prepare('SELECT 1 FROM messages WHERE account = ? AND chat_id = ? AND id = ?')
+  const drop = store.db.prepare('DELETE FROM messages WHERE account = ? AND chat_id = ? AND id = ?')
+  const rows = store.db
+    .prepare("SELECT account, chat_id, id, raw FROM messages WHERE raw LIKE '%HD_VIDEO_DUAL_UPLOAD%' OR raw LIKE '%HD_IMAGE_DUAL_UPLOAD%'")
+    .all()
+  for (const r of rows) {
+    let parent
+    try {
+      parent = JSON.parse(r.raw).message?.messageContextInfo?.messageAssociation?.parentMessageKey?.id
+    } catch {}
+    if (parent && hasParent.get(r.account, r.chat_id, parent)) drop.run(r.account, r.chat_id, r.id)
+  }
+}
 
 // Contas já ligadas reconectam sozinhas. Pastas de contas nunca ligadas são removidas.
 for (const a of [...accounts.values()]) {

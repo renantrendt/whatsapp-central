@@ -21,8 +21,17 @@ function thumbOf(media) {
   }
 }
 
+// 5 = HD_VIDEO_DUAL_UPLOAD, 10 = HD_IMAGE_DUAL_UPLOAD (the names appear in saved JSON).
+const HD_COPY = new Set([5, 10, 'HD_VIDEO_DUAL_UPLOAD', 'HD_IMAGE_DUAL_UPLOAD'])
+export function isHdCopy(message) {
+  return HD_COPY.has(message?.messageContextInfo?.messageAssociation?.associationType)
+}
+
 // Devolve null para o que não aparece como mensagem (reações, avisos internos).
 export function parseContent(waMessage) {
+  // A video or photo sent in HD arrives twice: the normal copy, then an HD copy
+  // linked to it. Show only the normal copy, as the phone does.
+  if (isHdCopy(waMessage.message)) return null
   const content = normalizeMessageContent(waMessage.message)
   if (!content) return null
   const type = getContentType(content)
