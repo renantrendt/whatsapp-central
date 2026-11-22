@@ -80,6 +80,7 @@ export class WaAccount {
       id: this.id,
       status: this.status,
       qr: this.qr,
+      pairCode: this.pairCode || null,
       me: this.me,
       error: this.error,
     }
@@ -128,7 +129,16 @@ export class WaAccount {
     return j
   }
 
-  async connect() {
+  // phone: número só com dígitos para ligar por código em vez de QR code.
+  async connect(phone) {
+    if (process.env.WC_DEBUG_AVATAR) {
+      const files = await fs.readdir(this.authDir).catch(() => [])
+      console.log(`[avatar] tokens=${files.filter((f) => f.startsWith('tctoken')).length} files=${files.length}`)
+    }
+    if (phone !== undefined) {
+      this.pairPhone = phone || null
+      this.pairCode = null
+    }
     if (this.sock || this.starting) return
     this.starting = true
     clearTimeout(this.timer)
@@ -147,6 +157,8 @@ export class WaAccount {
         ...(version ? { version } : {}),
         auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
         logger,
+        // "Desktop" também no celular: com a identidade de navegador ("Chrome") o WhatsApp
+        // não libera as fotos das pessoas, só as dos grupos.
         browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
         markOnlineOnConnect: false, // o celular continua recebendo as notificações
@@ -202,11 +214,26 @@ export class WaAccount {
   async onConnection(sock, state, { connection, lastDisconnect, qr }) {
     if (sock !== this.sock) return
     if (qr) {
-      const img = await QRCode.toDataURL(qr, { margin: 1, width: 320 })
-      this.set({ status: 'qr', qr: img })
+      if (this.pairPhone) {
+        // Ligação por número: o WhatsApp devolve um código de 8 letras para digitar
+        // no celular (Aparelhos conectados > Conectar com número de telefone).
+        if (!this.pairCode) {
+          try {
+            const code = await sock.requestPairingCode(this.pairPhone)
+            this.set({ status: 'code', pairCode: code, qr: null, error: null })
+          } catch (e) {
+            this.set({ status: 'idle', error: `Could not get a code: ${e.message}` })
+          }
+        }
+      } else {
+        const img = await QRCode.toDataURL(qr, { margin: 1, width: 320 })
+        this.set({ status: 'qr', qr: img })
+      }
     }
     if (connection === 'open') {
       this.retries = 0
+      this.pairPhone = null
+      this.pairCode = null
       this.set({
         status: 'open',
         qr: null,
@@ -239,7 +266,8 @@ export class WaAccount {
       }
       if (!linked && code !== DisconnectReason.restartRequired) {
         // O QR code venceu sem ser lido. Para aqui até a pessoa pedir de novo.
-        this.set({ status: 'idle', qr: null, error: 'The QR code expired.' })
+        this.pairCode = null
+        this.set({ status: 'idle', qr: null, error: 'The code expired.' })
         return
       }
       const wait = code === DisconnectReason.restartRequired ? 0 : Math.min(30000, 2000 * 2 ** this.retries++)
@@ -392,6 +420,43 @@ export class WaAccount {
     this.pumpAvatars()
   }
 
+  // Procura a foto pelos dois nomes que o WhatsApp dá a cada pessoa (o número e o
+  // identificador interno "lid"), em tamanho pequeno e depois grande.
+  async pictureUrl(chatId) {
+    const send = this.jidFor(chatId)
+    const ids = [send, chatId]
+    try {
+      const map = this.sock.signalRepository?.lidMapping
+      for (const j of [send, chatId]) {
+        if (j.endsWith('@s.whatsapp.net')) ids.push(await map?.getLIDForPN(j))
+        if (j.endsWith('@lid')) ids.push(await map?.getPNForLID(j))
+      }
+    } catch {}
+    const unique = [...new Set(ids.filter(Boolean).map((j) => jidNormalizedUser(j)))]
+    let last = null
+    for (const type of ['preview', 'image']) {
+      for (const jid of unique) {
+        try {
+          const url = await this.sock.profilePictureUrl(jid, type)
+          if (url) {
+            if (process.env.WC_DEBUG_AVATAR) console.log(`[avatar] ok ${jid.split('@')[1]} ${type}`)
+            return url
+          }
+        } catch (e) {
+          last = e
+        }
+      }
+    }
+    if (last && process.env.WC_DEBUG_AVATAR) {
+      const lids = unique.filter((j) => j.endsWith('@lid'))
+      const tok = lids.length ? await this.sock.authState.keys.get('tctoken', lids).catch(() => ({})) : {}
+      const has = lids.some((l) => tok?.[l]?.token?.length)
+      console.log(`[avatar] fail kinds=${unique.map((j) => j.split('@')[1]).join('+')} lid=${lids.length > 0} token=${has} err=${last?.message}`)
+    }
+    if (last) throw last
+    return undefined
+  }
+
   async pumpAvatars() {
     if (this.avatarBusy) return
     this.avatarBusy = true
@@ -400,22 +465,34 @@ export class WaAccount {
         const chatId = this.avatarQueue.shift()
         const now = Math.floor(Date.now() / 1000)
         let saved = 0
+        let retry = false // falha passageira: tenta de novo em 10 minutos
+        let pause = 400
         try {
-          const url = await this.sock.profilePictureUrl(this.jidFor(chatId), 'preview')
+          const url = await this.pictureUrl(chatId)
           const host = url ? new URL(url).hostname : ''
           if (url && url.startsWith('https://') && host.endsWith('.whatsapp.net')) {
             const res = await fetch(url)
-            if (res.ok) {
-              await fs.mkdir(this.avatarDir, { recursive: true })
-              await fs.writeFile(this.avatarFile(chatId), Buffer.from(await res.arrayBuffer()))
-              saved = now
-            }
+            if (!res.ok) throw new Error(`photo download answered ${res.status}`)
+            await fs.mkdir(this.avatarDir, { recursive: true })
+            await fs.writeFile(this.avatarFile(chatId), Buffer.from(await res.arrayBuffer()))
+            saved = now
           }
-        } catch {}
-        this.store.patchChat(this.id, chatId, { avatar: saved, avatar_checked: now })
+        } catch (e) {
+          // "item-not-found" = sem foto; "not-authorized" = a pessoa esconde a foto. Vale por 7 dias.
+          // Qualquer outro erro é passageiro (rede, WhatsApp pedindo para ir mais devagar).
+          const code = e?.output?.statusCode ?? e?.data
+          const final = code === 404 || code === 401 || /item-not-found|not-authorized/.test(e?.message || '')
+          if (!final) {
+            retry = true
+            console.error(`[avatar] ${code ?? ''} ${e?.message || e}`)
+            if (/rate|429/i.test(`${code} ${e?.message}`)) pause = 30000
+          }
+        }
+        const checked = retry ? now - 7 * 86400 + 600 : now
+        this.store.patchChat(this.id, chatId, { avatar: saved, avatar_checked: checked })
         this.avatarQueued.delete(chatId)
         if (saved) this.hub.chatChanged(this.id, chatId)
-        await new Promise((r) => setTimeout(r, 400))
+        await new Promise((r) => setTimeout(r, pause))
       }
     } finally {
       this.avatarBusy = false
@@ -442,6 +519,36 @@ export class WaAccount {
 
   jidFor(chatId) {
     return this.store.getChat(this.id, chatId)?.send_jid || chatId
+  }
+
+  mediaPath(msgId, mime) {
+    const ext = EXT[(mime || '').split(';')[0].trim()] || 'bin'
+    return path.join(this.mediaDir, `${msgId.replace(/[^A-Za-z0-9_-]/g, '')}.${ext}`)
+  }
+
+  // Envia uma foto (kind "image") ou uma mensagem de voz (kind "audio", já em OGG/Opus).
+  async sendMedia(chatId, { kind, buffer, mime, caption, seconds, waveform }) {
+    if (!this.sock || this.status !== 'open') throw new Error('Account is offline.')
+    let content
+    if (kind === 'image') {
+      content = { image: buffer, mimetype: mime, ...(caption ? { caption } : {}) }
+    } else if (kind === 'audio') {
+      content = {
+        audio: buffer,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true, // aparece como mensagem de voz, não como arquivo de áudio
+        seconds: Math.max(1, Math.round(seconds || 1)),
+        ...(waveform ? { waveform } : {}),
+      }
+    } else {
+      throw new Error('Unsupported file type.')
+    }
+    const sent = await this.sock.sendMessage(this.jidFor(chatId), content)
+    if (!sent) return
+    // Guarda o arquivo aqui para a tela mostrar sem baixar de novo do WhatsApp.
+    await fs.mkdir(this.mediaDir, { recursive: true })
+    await fs.writeFile(this.mediaPath(sent.key.id, content.mimetype), buffer).catch(() => {})
+    this.enqueue(() => this.onMessage(sent, false))
   }
 
   async send(chatId, text) {
@@ -472,8 +579,7 @@ export class WaAccount {
     const row = this.store.getMessage(this.id, chatId, msgId)
     if (!row?.raw) return null
     const mime = (row.mime || 'application/octet-stream').split(';')[0].trim()
-    const ext = EXT[mime] || 'bin'
-    const file = path.join(this.mediaDir, `${msgId.replace(/[^A-Za-z0-9_-]/g, '')}.${ext}`)
+    const file = this.mediaPath(msgId, mime)
     try {
       await fs.access(file)
     } catch {

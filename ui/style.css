@@ -90,7 +90,7 @@ body.side-collapsed #app { grid-template-columns: 44px 1fr; }
 }
 #chat-name { font-weight: 600; font-size: 15px; }
 #chat-sub { color: var(--muted); font-size: 12px; }
-.dialog-actions button, #composer button, .acct-row button {
+.dialog-actions button, #send, .acct-row button {
   border: 1px solid var(--line); background: var(--bg); border-radius: 9px; padding: 7px 12px;
 }
 .dialog-actions button:hover, .acct-row button:hover { background: var(--hover); }
@@ -133,8 +133,8 @@ body.side-collapsed #app { grid-template-columns: 44px 1fr; }
   border-radius: 12px; background: var(--bg); color: var(--text); font: inherit; outline: none;
 }
 #input:focus { border-color: var(--accent); }
-#composer button { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
-#composer button:disabled { opacity: 0.5; cursor: default; }
+#send { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+#send:disabled { opacity: 0.5; cursor: default; }
 
 dialog {
   border: 1px solid var(--line); border-radius: 16px; padding: 22px; width: 400px; max-width: calc(100vw - 32px);
@@ -244,3 +244,69 @@ body.resizing { cursor: col-resize; user-select: none; }
 .s-hint { color: var(--muted); font-size: 12px; }
 
 #empty-logo { display: block; margin: 0 auto 14px; }
+
+.only-narrow { display: none !important; }
+.link-btn { display: block; border: 0; background: none; color: var(--accent); padding: 10px 0 0; font-weight: 600; }
+.pair-code {
+  font: 700 30px/1.2 ui-monospace, Menlo, monospace; letter-spacing: 0.12em; color: var(--text);
+  text-align: center; padding: 14px; margin: 12px 0; border: 1px solid var(--line); border-radius: 12px;
+}
+.phone-input {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; font: inherit;
+  font-size: 17px; background: var(--bg); color: var(--text); outline: none;
+}
+.phone-input:focus { border-color: var(--accent); }
+.list-empty .primary { margin-top: 0; }
+.msg.show-react .react-bar { display: flex; }
+
+@media (max-width: 700px) {
+  body { font-size: 15px; }
+  #app, body.side-collapsed #app { grid-template-columns: 1fr; }
+  .only-narrow { display: grid !important; }
+  #side-toggle, #side-resize { display: none; }
+  #side { border-right: 0; }
+  body.show-main #side { display: none; }
+  body:not(.show-main) #main { display: none; }
+  #chat-head, #note-head { padding: 10px 12px; gap: 8px; }
+  #messages { padding: 12px; }
+  #composer { padding: 8px 10px; }
+  .msg-wrap { max-width: 86%; }
+  #note-body { padding: 14px 16px 60px; }
+  #palette { padding-top: 6vh; }
+  .row { padding: 10px 8px; }
+  .react-bar button { font-size: 20px; padding: 4px 6px; }
+}
+
+.sync-box { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--text); }
+.sync-box h3 { margin: 0 0 6px; font-size: 14px; }
+.sync-box p { margin: 6px 0; color: var(--muted); }
+.sync-box p.ok { color: var(--accent); }
+.sync-box p.err { color: var(--danger); }
+.sync-box small { color: var(--muted); }
+.pair-code.small { font-size: 15px; letter-spacing: 0.04em; padding: 10px; margin: 6px 0; user-select: all; }
+
+#composer { align-items: flex-end; }
+#composer .icon-btn { width: 38px; height: 38px; color: var(--muted); }
+#composer .icon-btn:hover { color: var(--text); }
+#composer [hidden] { display: none !important; }
+#staged {
+  display: flex; align-items: center; gap: 12px; padding: 10px 18px 0; color: var(--muted); font-size: 13px;
+}
+#staged[hidden] { display: none; }
+#staged img { width: 64px; height: 64px; object-fit: cover; border-radius: 10px; border: 1px solid var(--line); }
+#staged span { flex: 1; }
+#recorder {
+  display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-top: 1px solid var(--line);
+}
+#recorder[hidden] { display: none; }
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: #d93f3f; animation: rec-blink 1s infinite; }
+@keyframes rec-blink { 50% { opacity: 0.25; } }
+#rec-time { font-variant-numeric: tabular-nums; font-weight: 600; }
+.rec-hint { flex: 1; color: var(--muted); }
+#rec-send { border: 0; background: var(--accent); color: #fff; font-weight: 600; border-radius: 9px; padding: 8px 16px; }
+@media (max-width: 700px) {
+  #staged { padding: 8px 10px 0; }
+  #recorder { padding: 10px; }
+}
+
+.msg .text a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; overflow-wrap: anywhere; }

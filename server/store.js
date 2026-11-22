@@ -1,9 +1,10 @@
 // Banco local (SQLite) com conversas, mensagens e contatos das duas contas.
 // Tudo fica em um arquivo neste Mac. Nada sai do computador por aqui.
-import { DatabaseSync } from 'node:sqlite'
+import { randomUUID } from 'node:crypto'
+import { openDatabase } from './sqlite.js'
 
-export function openStore(file) {
-  const db = new DatabaseSync(file)
+export async function openStore(file) {
+  const db = await openDatabase(file)
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -69,9 +70,18 @@ export function openStore(file) {
       db.exec(`ALTER TABLE chats ADD COLUMN ${col}`)
     } catch {}
   }
-  try {
-    db.exec('ALTER TABLE notes ADD COLUMN body TEXT')
-  } catch {}
+  // Colunas para sincronizar notas entre aparelhos: uid é o mesmo em todos os
+  // aparelhos, mtime é a hora da última edição em milissegundos e deleted marca
+  // uma nota apagada (fica guardada para o outro aparelho também apagar).
+  for (const col of ['body TEXT', 'uid TEXT', 'mtime INTEGER NOT NULL DEFAULT 0', 'deleted INTEGER NOT NULL DEFAULT 0']) {
+    try {
+      db.exec(`ALTER TABLE notes ADD COLUMN ${col}`)
+    } catch {}
+  }
+  db.exec('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+  for (const r of db.prepare('SELECT id, updated FROM notes WHERE uid IS NULL').all()) {
+    db.prepare('UPDATE notes SET uid = ?, mtime = ? WHERE id = ?').run(randomUUID(), r.updated * 1000, r.id)
+  }
 
   const q = {
     getChat: db.prepare('SELECT * FROM chats WHERE account = ? AND id = ?'),
@@ -250,24 +260,74 @@ export function openStore(file) {
 
     // Notas com lista de tarefas. Não pertencem a nenhuma conta de WhatsApp.
     listNotes() {
-      return db.prepare('SELECT * FROM notes ORDER BY updated DESC').all().map(viewNote)
+      return db.prepare('SELECT * FROM notes WHERE deleted = 0 ORDER BY updated DESC').all().map(viewNote)
     },
 
     saveNote(id, title, body) {
-      const now = Math.floor(Date.now() / 1000)
-      if (id && db.prepare('SELECT 1 FROM notes WHERE id = ?').get(id)) {
-        db.prepare('UPDATE notes SET title = ?, body = ?, updated = ? WHERE id = ?').run(title, body, now, id)
+      const ms = Date.now()
+      const now = Math.floor(ms / 1000)
+      if (id && db.prepare('SELECT 1 FROM notes WHERE id = ? AND deleted = 0').get(id)) {
+        db.prepare('UPDATE notes SET title = ?, body = ?, updated = ?, mtime = ? WHERE id = ?').run(title, body, now, ms, id)
       } else {
         id = Number(
-          db.prepare('INSERT INTO notes (title, body, created, updated) VALUES (?, ?, ?, ?)')
-            .run(title, body, now, now).lastInsertRowid
+          db.prepare('INSERT INTO notes (uid, title, body, created, updated, mtime) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(randomUUID(), title, body, now, now, ms).lastInsertRowid
         )
       }
       return viewNote(db.prepare('SELECT * FROM notes WHERE id = ?').get(id))
     },
 
+    // A nota apagada vira uma "lápide": sem texto, marcada como apagada.
     deleteNote(id) {
-      db.prepare('DELETE FROM notes WHERE id = ?').run(id)
+      const ms = Date.now()
+      db.prepare("UPDATE notes SET deleted = 1, title = '', body = '', items = '[]', updated = ?, mtime = ? WHERE id = ?")
+        .run(Math.floor(ms / 1000), ms, id)
+    },
+
+    // Todas as notas, inclusive as apagadas, no formato trocado entre aparelhos.
+    exportNotes() {
+      return db.prepare('SELECT * FROM notes').all().map((r) => ({
+        uid: r.uid,
+        title: r.title,
+        body: r.body ?? itemsToHtml(r.items),
+        created: r.created,
+        updated: r.updated,
+        mtime: r.mtime,
+        deleted: r.deleted ? 1 : 0,
+      }))
+    },
+
+    // Junta notas que vieram de outro aparelho. Vale a edição mais recente.
+    // Devolve quantas notas mudaram aqui.
+    mergeNotes(list) {
+      let changed = 0
+      store.transaction(() => {
+        for (const n of Array.isArray(list) ? list : []) {
+          if (!n || typeof n.uid !== 'string' || !n.uid || typeof n.mtime !== 'number') continue
+          const row = [String(n.title || '').slice(0, 200), String(n.body || '').slice(0, 1_500_000),
+            Number(n.created) || 0, Number(n.updated) || 0, n.mtime, n.deleted ? 1 : 0]
+          const local = db.prepare('SELECT id, mtime FROM notes WHERE uid = ?').get(n.uid)
+          if (!local) {
+            db.prepare('INSERT INTO notes (title, body, created, updated, mtime, deleted, uid) VALUES (?, ?, ?, ?, ?, ?, ?)')
+              .run(...row, n.uid)
+            changed++
+          } else if (n.mtime > local.mtime) {
+            db.prepare('UPDATE notes SET title = ?, body = ?, created = ?, updated = ?, mtime = ?, deleted = ? WHERE id = ?')
+              .run(...row, local.id)
+            changed++
+          }
+        }
+      })
+      return changed
+    },
+
+    getSetting(key) {
+      return db.prepare('SELECT value FROM settings WHERE key = ?').get(key)?.value ?? null
+    },
+
+    setSetting(key, value) {
+      db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+        .run(key, value)
     },
 
     version() {

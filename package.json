@@ -9,11 +9,12 @@
     "start": "node server/index.js",
     "demo": "WC_DEMO=1 node server/index.js",
     "app": "electron .",
-    "package": "electron-packager . \"Whatsapp Central\" --platform=darwin --arch=arm64 --out=dist --overwrite --no-asar --app-bundle-id=local.whatsappcentral.app --icon=build/icon.icns --ignore='^/dist' --ignore='^/\\.git' --ignore='^/docs' --ignore='^/build/logo-options' && cp build/icon.icns \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app/Contents/Resources/electron.icns\" && touch \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app\"",
+    "package": "electron-packager . \"Whatsapp Central\" --platform=darwin --arch=arm64 --out=dist --overwrite --no-asar --app-bundle-id=local.whatsappcentral.app --icon=build/icon.icns --extend-info=build/Info.extra.plist --ignore='^/dist' --ignore='^/\\.git' --ignore='^/docs' --ignore='^/build/logo-options' && cp build/icon.icns \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app/Contents/Resources/electron.icns\" && touch \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app\"",
     "screenshots": "electron scripts/screenshots.cjs"
   },
   "dependencies": {
     "baileys": "^7.0.0-rc14",
+    "node-sqlite3-wasm": "^0.8.61",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {

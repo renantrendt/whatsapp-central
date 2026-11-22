@@ -70,8 +70,23 @@ export class DemoAccount {
     this.hub.ingest(this.id, this.msg(chatId, text, { fromMe: true }), { live: false })
   }
 
-  async media() {
-    return null
+  async media(chatId, msgId) {
+    return this.files?.get(msgId) || null
+  }
+
+  // Na demonstração o arquivo fica numa pasta temporária, para a tela conseguir mostrar.
+  async sendMedia(chatId, { kind, buffer, mime, caption }) {
+    const { default: os } = await import('node:os')
+    const { default: fsp } = await import('node:fs/promises')
+    const { default: path } = await import('node:path')
+    const m = this.msg(chatId, caption || '', { fromMe: true, kind })
+    m.mime = kind === 'audio' ? 'audio/ogg; codecs=opus' : mime
+    const dir = path.join(os.tmpdir(), 'wc-demo-media')
+    await fsp.mkdir(dir, { recursive: true })
+    const file = path.join(dir, `${m.id}.${kind === 'audio' ? 'ogg' : 'img'}`)
+    await fsp.writeFile(file, buffer)
+    ;(this.files ||= new Map()).set(m.id, { file, mime: m.mime.split(';')[0], fileName: '' })
+    this.hub.ingest(this.id, m, { live: false })
   }
 
   async react(chatId, msgId, emoji) {

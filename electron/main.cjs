@@ -1,6 +1,6 @@
 // Janela do app no Mac. Ela sobe o servidor local dentro do próprio app e
 // abre a tela. Fechar a janela não encerra o app: ele continua recebendo.
-const { app, BrowserWindow, Menu, shell } = require('electron')
+const { app, BrowserWindow, Menu, shell, session, systemPreferences } = require('electron')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
@@ -128,6 +128,14 @@ if (!app.requestSingleInstanceLock()) {
     // A pasta mantém o nome antigo para não perder os dados de quem já usava o app.
     process.env.WC_DATA = path.join(app.getPath('appData'), 'WhatsCentral')
     await import(pathToFileURL(path.join(__dirname, '..', 'server', 'index.js')).href)
+    // Microfone para mensagens de voz: o macOS pergunta uma vez se o app pode usar.
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, done, details) => {
+      if (permission === 'media' && details.mediaTypes?.includes('audio') && process.platform === 'darwin') {
+        systemPreferences.askForMediaAccess('microphone').then(done, () => done(false))
+      } else {
+        done(true) // o mesmo comportamento de antes para as outras permissões
+      }
+    })
     buildMenu()
     createWindow()
   })

@@ -7,8 +7,34 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { webcrypto } from 'node:crypto'
+
+// O Node 18 (usado no Android) não expõe globalThis.crypto, que a biblioteca de WhatsApp usa.
+if (!globalThis.crypto) globalThis.crypto = webcrypto
+
+// O Node do Android vem sem ICU (a biblioteca de textos internacionais) e recusa
+// new TextDecoder(..., { fatal: true }). Sem ICU, o mesmo leitor funciona sem essa opção.
+try {
+  new TextDecoder('utf-8', { fatal: true })
+} catch {
+  const Base = globalThis.TextDecoder
+  globalThis.TextDecoder = class extends Base {
+    constructor(label, opts = {}) {
+      const { fatal, ...rest } = opts
+      super(label, rest)
+    }
+  }
+}
+
+// No celular o servidor roda dentro do app: um erro inesperado não pode fechar o app inteiro.
+if (process.env.WC_MOBILE) {
+  process.on('uncaughtException', (e) => console.error('[uncaught]', e))
+  process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
+}
 import { openStore } from './store.js'
 import { createHub, previewOf } from './hub.js'
+import { startSync } from './sync.js'
+import { webmToOgg } from './ogg.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const uiDir = path.join(here, '..', 'ui')
@@ -19,9 +45,15 @@ const dataDir =
   process.env.WC_DATA || path.join(os.homedir(), 'Library', 'Application Support', 'WhatsCentral')
 
 if (!demo) fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
-const store = openStore(demo ? ':memory:' : path.join(dataDir, 'app.db'))
+const store = await openStore(demo ? ':memory:' : path.join(dataDir, 'app.db'))
 const hub = createHub(store)
-const token = crypto.randomBytes(24).toString('hex')
+// Sincronização das notas com o outro aparelho (não roda no modo de demonstração).
+const sync = demo ? null : startSync({ store, onNotesChanged: () => hub.events.emit('event', { type: 'notes' }) })
+// No Android o app passa o segredo por WC_TOKEN, para o serviço de avisos também ler os eventos.
+const token = /^[a-f0-9]{32,}$/.test(process.env.WC_TOKEN || '')
+  ? process.env.WC_TOKEN
+  : crypto.randomBytes(24).toString('hex')
+const digits = (v) => (v == null ? undefined : String(v).replace(/\D/g, ''))
 
 const accounts = new Map()
 const accountViews = () => [...accounts.values()].map((a) => a.view())
@@ -62,6 +94,9 @@ if (store.version() < 2) {
   })
   store.setVersion(2)
 }
+
+// Conversas sem foto são conferidas de novo a cada abertura (só as que aparecem na tela).
+if (!demo) store.db.prepare('UPDATE chats SET avatar_checked = 0 WHERE avatar = 0').run()
 
 // Contas já ligadas reconectam sozinhas. Pastas de contas nunca ligadas são removidas.
 for (const a of [...accounts.values()]) {
@@ -147,6 +182,24 @@ function readBody(req) {
   })
 }
 
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    let size = 0
+    const parts = []
+    req.on('data', (c) => {
+      size += c.length
+      if (size > limit) {
+        reject(new Error('file too large'))
+        req.destroy()
+        return
+      }
+      parts.push(c)
+    })
+    req.on('end', () => resolve(Buffer.concat(parts)))
+    req.on('error', reject)
+  })
+}
+
 const hosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`])
 
 function authorized(req) {
@@ -180,7 +233,7 @@ const server = http.createServer(async (req, res) => {
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
         'content-security-policy':
-          "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
+          "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'",
       }
       if (name === 'index.html') headers['set-cookie'] = `wc=${token}; HttpOnly; SameSite=Strict; Path=/`
       res.writeHead(200, headers)
@@ -197,6 +250,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/api/notes') {
       return json(res, 200, { notes: store.listNotes() })
+    }
+
+    if (req.method === 'GET' && p === '/api/sync') {
+      return json(res, 200, sync ? sync.status() : { code: null, peers: [], lastSync: 0, error: 'Not available in demo mode.' })
     }
 
     if (req.method === 'GET' && p === '/api/events') {
@@ -243,6 +300,34 @@ const server = http.createServer(async (req, res) => {
       return sendFile(req, res, file, { 'content-type': 'image/jpeg', 'cache-control': 'private, max-age=604800' })
     }
 
+    // Foto ou mensagem de voz: o corpo do pedido é o próprio arquivo.
+    if (req.method === 'POST' && p === '/api/send-file') {
+      const acc = accounts.get(arg('account'))
+      if (!acc) return json(res, 400, { error: 'unknown account' })
+      const kind = arg('kind')
+      let mime = String(arg('mime') || '').toLowerCase()
+      let buffer = await readRaw(req, 64 * 1024 * 1024)
+      if (!buffer.length) return json(res, 400, { error: 'empty file' })
+      if (kind === 'image' && !/^image\/(jpeg|png|webp|gif)$/.test(mime)) {
+        return json(res, 400, { error: 'Only JPEG, PNG, WebP or GIF images.' })
+      }
+      if (kind === 'audio') {
+        if (mime.startsWith('audio/webm')) buffer = webmToOgg(buffer)
+        else if (!mime.startsWith('audio/ogg')) return json(res, 400, { error: 'Recording format not supported.' })
+        mime = 'audio/ogg; codecs=opus'
+      }
+      const waveform = arg('waveform') ? Buffer.from(arg('waveform'), 'base64') : undefined
+      await acc.sendMedia(arg('chat'), {
+        kind,
+        buffer,
+        mime,
+        caption: String(arg('caption') || '').slice(0, 4000),
+        seconds: Number(arg('seconds')) || 0,
+        waveform,
+      })
+      return json(res, 200, { ok: true })
+    }
+
     if (req.method === 'POST') {
       const body = await readBody(req)
 
@@ -255,7 +340,7 @@ const server = http.createServer(async (req, res) => {
           acc = new WaAccount({ id, dataDir, hub, store, onChange })
           accounts.set(id, acc)
         }
-        acc.connect()
+        acc.connect(digits(body.phone))
         onChange()
         return json(res, 200, { id: acc.id })
       }
@@ -263,10 +348,22 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/notes/save') {
         const title = String(body.title || '').slice(0, 200)
         const html = String(body.body || '').slice(0, 1_500_000)
-        return json(res, 200, { note: store.saveNote(Number(body.id) || null, title, html) })
+        const note = store.saveNote(Number(body.id) || null, title, html)
+        sync?.changed()
+        return json(res, 200, { note })
       }
       if (p === '/api/notes/delete') {
         store.deleteNote(Number(body.id))
+        sync?.changed()
+        return json(res, 200, { ok: true })
+      }
+      if (p === '/api/sync/pair') {
+        if (!sync) return json(res, 400, { error: 'Not available in demo mode.' })
+        await sync.pair(String(body.code || ''))
+        return json(res, 200, sync.status())
+      }
+      if (p === '/api/sync/unpair') {
+        sync?.unpair()
         return json(res, 200, { ok: true })
       }
 
@@ -274,7 +371,9 @@ const server = http.createServer(async (req, res) => {
       if (!acc) return json(res, 400, { error: 'unknown account' })
 
       if (p === '/api/connect') {
-        acc.connect()
+        // Trocar entre QR code e código por número reinicia a tentativa de ligação.
+        if ('phone' in body) await acc.stop()
+        acc.connect('phone' in body ? digits(body.phone) || '' : undefined)
         return json(res, 200, { ok: true })
       }
       if (p === '/api/cancel') {

@@ -10,6 +10,9 @@ const el = (tag, cls, text) => {
 const keyOf = (c) => `${c.account}|${c.id}`
 const MAX_ROWS = 300
 const QUICK = ['👍', '❤️', '😂', '😮', '😢', '🙏']
+// No celular (app Android) a tela mostra uma coisa por vez: a lista ou a conversa.
+const isPhone = /Android|iPhone/i.test(navigator.userAgent)
+const narrow = () => matchMedia('(max-width: 700px)').matches
 
 const state = {
   accounts: [],
@@ -106,6 +109,7 @@ function renderEmpty() {
 // Mostra só uma das áreas da direita: vazio, conversa ou nota.
 function showMain(which) {
   for (const id of ['empty', 'chat', 'note']) $(id).hidden = id !== which
+  document.body.classList.toggle('show-main', which !== 'empty')
   if (which === 'empty') renderEmpty()
 }
 
@@ -127,6 +131,7 @@ function showDialog(d) {
 }
 
 async function connectNew() {
+  if (isPhone) return showDialog({ mode: 'phone' })
   try {
     const { id } = await api('/api/connect-new', {})
     showDialog({ mode: 'connect', account: id })
@@ -169,10 +174,15 @@ function renderDialog() {
       add.onclick = connectNew
       body.append(add)
     }
+    const syncBox = el('div', 'sync-box')
+    body.append(syncBox)
+    renderSync(syncBox)
     return
   }
 
-  // modo "connect": mostra o QR code de uma conta nova
+  if (d.mode === 'phone') return renderPhoneForm(body, d)
+
+  // modo "connect": mostra o QR code ou o código de uma conta nova
   const a = accountOf(d.account)
   $('dialog-title').textContent = 'Connect new account'
   if (!a) {
@@ -180,6 +190,16 @@ function renderDialog() {
   } else if (a.status === 'open') {
     body.append(el('p', null, `Connected as ${a.me}. Loading conversations...`))
     setTimeout(() => state.dialog?.account === a.id && $('dialog').close(), 1500)
+  } else if (a.status === 'code' && a.pairCode) {
+    body.append(el('p', null, 'On the phone with this number, open WhatsApp and type this code:'))
+    body.append(el('div', 'pair-code', `${a.pairCode.slice(0, 4)}-${a.pairCode.slice(4)}`))
+    const ol = el('ol')
+    for (const s of [
+      'Go to Settings, then Linked devices.',
+      'Tap Link a device.',
+      'Tap Link with phone number instead and type the code above.',
+    ]) ol.append(el('li', null, s))
+    body.append(ol)
   } else if (a.status === 'qr' && a.qr) {
     const img = el('img', 'qr')
     img.src = a.qr
@@ -192,14 +212,120 @@ function renderDialog() {
       'Tap Link a device and point the camera at this code.',
     ]) ol.append(el('li', null, s))
     body.append(ol)
+    body.append(linkButton('Link with phone number instead', () => showDialog({ mode: 'phone', account: a.id })))
   } else if (a.status === 'connecting') {
     body.append(el('p', null, 'Connecting...'))
   } else {
     if (a.error) body.append(el('p', 'err', a.error))
-    const b = el('button', 'primary', 'Show a new QR code')
+    const b = el('button', 'primary', 'Try again')
     b.onclick = () => api('/api/connect', { account: a.id }).catch(alertError)
     body.append(b)
+    body.append(linkButton('Link with phone number instead', () => showDialog({ mode: 'phone', account: a.id })))
   }
+}
+
+// Sincronização das notas com o outro aparelho, pelo Tailscale.
+async function renderSync(box) {
+  box.replaceChildren(el('h3', null, 'Notes sync'))
+  let s
+  try {
+    s = await api('/api/sync')
+  } catch {
+    box.append(el('p', null, 'Not available.'))
+    return
+  }
+  if (s.peers.length) {
+    box.append(el('p', 'ok', `Syncing with ${s.peers.map((p) => p.split(':')[0]).join(', ')}`))
+    box.append(el('small', null, s.lastSync ? `Last sync at ${clock(s.lastSync / 1000)}` : 'Not synced yet'))
+    if (s.error) box.append(el('p', 'err', s.error))
+    box.append(linkButton('Stop syncing', async () => {
+      if (!confirm('Stop syncing notes with the other device? Notes already copied stay on both.')) return
+      await api('/api/sync/unpair', {}).catch(alertError)
+      renderSync(box)
+    }))
+    return
+  }
+  if (s.error) box.append(el('p', 'err', s.error))
+  if (s.code) {
+    box.append(el('p', null, 'Code of this device. Type it on the other device:'))
+    box.append(el('div', 'pair-code small', s.code))
+  } else {
+    box.append(el('p', null, 'Turn on Tailscale on this device to sync notes.'))
+  }
+  box.append(el('p', null, 'Or type the code shown on the other device:'))
+  const input = el('input', 'phone-input')
+  input.placeholder = '100.101.150.56/ABCD2345EFGH'
+  input.autocapitalize = 'characters'
+  input.spellcheck = false
+  const go = el('button', 'primary', 'Pair')
+  go.onclick = async () => {
+    go.disabled = true
+    try {
+      await api('/api/sync/pair', { code: input.value })
+      await reloadNotes()
+      renderSync(box)
+    } catch (e) {
+      go.disabled = false
+      alertError(e)
+    }
+  }
+  box.append(input, go)
+}
+
+function linkButton(text, onclick) {
+  const b = el('button', 'link-btn', text)
+  b.type = 'button'
+  b.onclick = onclick
+  return b
+}
+
+// Ligação por número: o WhatsApp mostra um código de 8 letras para digitar no
+// celular. É o único jeito quando o app roda no mesmo celular do WhatsApp.
+function renderPhoneForm(body, d) {
+  $('dialog-title').textContent = 'Connect new account'
+  body.append(el('p', null, 'Type the WhatsApp number with country code.'))
+  const input = el('input', 'phone-input')
+  input.type = 'tel'
+  input.placeholder = '+55 11 91234-5678'
+  input.autocomplete = 'tel'
+  const go = el('button', 'primary', 'Get code')
+  const submit = async () => {
+    const phone = input.value.replace(/\D/g, '')
+    if (phone.length < 8) return alert('Type the full number with country code.')
+    go.disabled = true
+    try {
+      if (d.account) {
+        await api('/api/connect', { account: d.account, phone })
+        showDialog({ mode: 'connect', account: d.account })
+      } else {
+        const { id } = await api('/api/connect-new', { phone })
+        showDialog({ mode: 'connect', account: id })
+      }
+    } catch (e) {
+      go.disabled = false
+      alertError(e)
+    }
+  }
+  go.onclick = submit
+  // addEventListener, não onkeydown: um onkeydown que devolve false cancela a tecla.
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submit()
+  })
+  body.append(input, go)
+  body.append(linkButton('Use a QR code instead', async () => {
+    try {
+      if (d.account) {
+        await api('/api/connect', { account: d.account, phone: null })
+        showDialog({ mode: 'connect', account: d.account })
+      } else {
+        const { id } = await api('/api/connect-new', {})
+        showDialog({ mode: 'connect', account: id })
+      }
+    } catch (e) {
+      alertError(e)
+    }
+  }))
+  setTimeout(() => input.focus(), 50)
 }
 
 $('dialog-close').onclick = () => $('dialog').close()
@@ -207,7 +333,9 @@ $('dialog').addEventListener('close', () => {
   const d = state.dialog
   state.dialog = null
   // Fechou a janela do QR code sem ligar: desiste dessa conta nova.
-  if (d?.mode === 'connect') api('/api/cancel', { account: d.account }).catch(() => {})
+  if ((d?.mode === 'connect' || d?.mode === 'phone') && d.account && !state.dialog) {
+    api('/api/cancel', { account: d.account }).catch(() => {})
+  }
 })
 $('empty-connect').onclick = connectNew
 
@@ -228,6 +356,15 @@ function renderList() {
   const box = $('list')
   const rows = visibleChats()
   box.replaceChildren()
+  if (!state.accounts.length && !state.demo) {
+    box.append(el('div', 'list-empty', 'No WhatsApp account connected yet.'))
+    const b = el('button', 'primary', 'Connect account')
+    b.onclick = connectNew
+    const wrap = el('div', 'list-empty')
+    wrap.append(b)
+    box.append(wrap)
+    return
+  }
   if (!rows.length) {
     box.append(el('div', 'list-empty',
       state.tab === 'inbox' ? 'Inbox is empty.' : 'No archived conversations.'))
@@ -251,6 +388,13 @@ function renderList() {
     row.append(end)
 
     row.onclick = () => openChat(k)
+    // Clique direito (ou toque longo no celular) arquiva ou desarquiva.
+    row.oncontextmenu = (e) => {
+      e.preventDefault()
+      showMenu(e.clientX, e.clientY, [
+        { label: c.archived ? 'Unarchive' : 'Archive', action: () => setArchived(c, !c.archived) },
+      ])
+    }
     box.append(row)
   }
   if (rows.length > MAX_ROWS) {
@@ -287,9 +431,16 @@ function closeChat() {
 async function openChat(k) {
   const c = state.chats.get(k)
   if (!c) return
+  if (state.selected !== k) {
+    stopRecording(true)
+    clearStaged()
+  }
   state.selected = k
   state.messages = []
   showMain('chat')
+  try {
+    window.Android?.chatOpened(k) // apaga o aviso dessa conversa no Android
+  } catch {}
   renderChatHead()
   renderList()
   $('messages').replaceChildren()
@@ -319,6 +470,67 @@ const mediaUrl = (m) =>
 
 const react = (m, emoji) =>
   api('/api/react', { account: m.account, chat: m.chatId, id: m.id, emoji }).catch(alertError)
+
+// Texto da mensagem com os endereços de site clicáveis, como no WhatsApp:
+// "https://...", "www...." e também "site.com.br", desde que a terminação
+// (.com, .br, .io...) exista na lista oficial da IANA (ui/tlds.js).
+// O texto continua entrando como texto puro, nunca como HTML.
+const SCHEME_RE = /\b(?:https?:\/\/|www\.)[^\s<>"]+/gi
+const DOMAIN_RE = /(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z][a-z0-9-]{1,62})(?::\d{2,5})?(?:[/?#][^\s<>"]*)?/gi
+
+function trimUrl(url) {
+  // Pontuação no fim da frase não faz parte do endereço.
+  while (/[.,!?;:)\]}'"]$/.test(url)) url = url.slice(0, -1)
+  return url
+}
+
+function findLinks(text) {
+  const found = []
+  for (const m of text.matchAll(SCHEME_RE)) {
+    const url = trimUrl(m[0])
+    if (url) found.push({ index: m.index, url, href: /^https?:\/\//i.test(url) ? url : `https://${url}` })
+  }
+  for (const m of text.matchAll(DOMAIN_RE)) {
+    const before = text[m.index - 1] || ''
+    // Fora: parte de um e-mail (fulano@site.com), de outra palavra ou de um endereço já achado.
+    if (/[\w@.\/:-]/.test(before)) continue
+    if (!TLDS.has(m[1].toLowerCase())) continue
+    const url = trimUrl(m[0])
+    if (!url.includes('.')) continue
+    found.push({ index: m.index, url, href: `https://${url}` })
+  }
+  found.sort((a, b) => a.index - b.index)
+  const out = []
+  let end = 0
+  for (const f of found) {
+    if (f.index < end) continue // sobreposto a um link anterior
+    try {
+      if (!['http:', 'https:'].includes(new URL(f.href).protocol)) continue
+    } catch {
+      continue
+    }
+    out.push(f)
+    end = f.index + f.url.length
+  }
+  return out
+}
+
+function linkify(text) {
+  const box = el('div', 'text')
+  let last = 0
+  for (const f of findLinks(text)) {
+    box.append(document.createTextNode(text.slice(last, f.index)))
+    const a = el('a', null, f.url)
+    a.href = f.href
+    a.target = '_blank'
+    a.rel = 'noopener noreferrer'
+    a.onclick = (e) => e.stopPropagation() // não abre a barra de reações no celular
+    box.append(a)
+    last = f.index + f.url.length
+  }
+  box.append(document.createTextNode(text.slice(last)))
+  return box
+}
 
 function messageNode(m, isGroup) {
   const wrap = el('div', `msg-wrap${m.fromMe ? ' me' : ''}`)
@@ -369,7 +581,7 @@ function messageNode(m, isGroup) {
     n.append(el('div', 'note', names[m.kind] || 'Message'))
   }
 
-  if (!m.deleted && m.text) n.append(el('div', 'text', m.text))
+  if (!m.deleted && m.text) n.append(linkify(m.text))
   n.append(el('div', 'meta', (m.edited ? 'edited - ' : '') + clock(m.ts)))
 
   if (!m.deleted) {
@@ -384,6 +596,8 @@ function messageNode(m, isGroup) {
     n.append(bar)
   }
   wrap.append(n)
+  // Na tela de toque não existe "passar o mouse": um toque mostra os emojis.
+  if (matchMedia('(hover: none)').matches) n.onclick = () => n.classList.toggle('show-react')
 
   if (m.reactions?.length) {
     const chips = el('div', 'chips')
@@ -464,20 +678,179 @@ $('composer').addEventListener('submit', async (e) => {
   e.preventDefault()
   const c = state.chats.get(state.selected)
   const text = input.value.trim()
-  if (!c || !text) return
-  const btn = $('composer').querySelector('button')
+  if (!c || (!text && !staged)) return
+  const btn = $('send')
   btn.disabled = true
   try {
-    await api('/api/send', { account: c.account, chat: c.id, text })
+    if (staged) {
+      // Foto com legenda: o texto digitado vai junto.
+      await upload(c, staged.file, { kind: 'image', mime: staged.file.type, caption: text })
+      clearStaged()
+    } else {
+      await api('/api/send', { account: c.account, chat: c.id, text })
+    }
     input.value = ''
     input.style.height = 'auto'
   } catch (err) {
     alertError(err)
   } finally {
     btn.disabled = false
+    updateComposer()
     input.focus()
   }
 })
+
+// Mostra o microfone quando a caixa está vazia e "Send" quando há texto ou foto.
+function updateComposer() {
+  const ready = input.value.trim().length > 0 || !!staged
+  $('send').hidden = !ready
+  $('mic').hidden = ready || !navigator.mediaDevices?.getUserMedia
+}
+input.addEventListener('input', updateComposer)
+
+// Envia um arquivo (foto ou voz). O corpo do pedido é o próprio arquivo.
+async function upload(c, blob, opts) {
+  const params = new URLSearchParams({ account: c.account, chat: c.id })
+  for (const [k, v] of Object.entries(opts)) if (v != null && v !== '') params.set(k, v)
+  const res = await fetch(`/api/send-file?${params}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: blob,
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || 'Could not send.')
+}
+
+// ---------- foto ----------
+const IMAGE_TYPES = /^image\/(jpeg|png|webp|gif)$/
+let staged = null // foto escolhida, esperando o envio
+
+function stageImage(file) {
+  if (!file) return
+  if (!IMAGE_TYPES.test(file.type)) return alert('Only JPEG, PNG, WebP or GIF images.')
+  clearStaged()
+  staged = { file, url: URL.createObjectURL(file) }
+  $('staged-img').src = staged.url
+  $('staged').hidden = false
+  updateComposer()
+  input.focus()
+}
+
+function clearStaged() {
+  if (staged) URL.revokeObjectURL(staged.url)
+  staged = null
+  $('staged').hidden = true
+  $('file').value = ''
+  updateComposer()
+}
+
+$('attach').onclick = () => $('file').click()
+$('file').onchange = () => stageImage($('file').files[0])
+$('staged-remove').onclick = clearStaged
+// Colar uma imagem (⌘V) ou arrastar para a conversa também prepara a foto.
+input.addEventListener('paste', (e) => {
+  const f = [...(e.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'))
+  if (f) {
+    e.preventDefault()
+    stageImage(f)
+  }
+})
+$('chat').addEventListener('dragover', (e) => e.preventDefault())
+$('chat').addEventListener('drop', (e) => {
+  const f = [...(e.dataTransfer?.files || [])].find((x) => x.type.startsWith('image/'))
+  if (f) {
+    e.preventDefault()
+    stageImage(f)
+  }
+})
+
+// ---------- mensagem de voz ----------
+// O navegador grava em WebM/Opus; o servidor converte para OGG/Opus, o formato
+// das mensagens de voz do WhatsApp.
+const rec = { recorder: null, stream: null, chunks: [], start: 0, timer: null, cancel: false, chat: null }
+
+async function startRecording() {
+  const c = state.chats.get(state.selected)
+  if (!c || rec.recorder) return
+  try {
+    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+  } catch {
+    return alert('The microphone is not available. Allow microphone access for Whatsapp Central in the system settings.')
+  }
+  const type = ['audio/ogg;codecs=opus', 'audio/webm;codecs=opus'].find((t) => MediaRecorder.isTypeSupported(t))
+  if (!type) {
+    stopStream()
+    return alert('This device cannot record voice messages.')
+  }
+  Object.assign(rec, { chunks: [], cancel: false, chat: c, start: Date.now() })
+  rec.recorder = new MediaRecorder(rec.stream, { mimeType: type, audioBitsPerSecond: 32000 })
+  rec.recorder.ondataavailable = (e) => e.data.size && rec.chunks.push(e.data)
+  rec.recorder.onstop = finishRecording
+  rec.recorder.start(250)
+  $('composer').hidden = true
+  $('recorder').hidden = false
+  const tick = () => {
+    const s = Math.floor((Date.now() - rec.start) / 1000)
+    $('rec-time').textContent = `${Math.floor(s / 60)}:${two(s % 60)}`
+    if (s >= 15 * 60) stopRecording(false) // limite de 15 minutos
+  }
+  tick()
+  rec.timer = setInterval(tick, 250)
+}
+
+function stopStream() {
+  rec.stream?.getTracks().forEach((t) => t.stop())
+  rec.stream = null
+}
+
+function stopRecording(cancel) {
+  if (!rec.recorder) return
+  rec.cancel = cancel
+  if (rec.recorder.state !== 'inactive') rec.recorder.stop()
+}
+
+async function finishRecording() {
+  const recorder = rec.recorder
+  rec.recorder = null
+  clearInterval(rec.timer)
+  stopStream()
+  $('recorder').hidden = true
+  $('composer').hidden = false
+  const seconds = (Date.now() - rec.start) / 1000
+  if (rec.cancel || seconds < 0.8) return
+  const blob = new Blob(rec.chunks, { type: recorder.mimeType })
+  const waveform = await computeWaveform(blob).catch(() => null)
+  try {
+    await upload(rec.chat, blob, { kind: 'audio', mime: blob.type, seconds: seconds.toFixed(1), waveform })
+  } catch (e) {
+    alertError(e)
+  }
+}
+
+// As 64 barrinhas que o WhatsApp mostra na mensagem de voz (valores de 0 a 100).
+async function computeWaveform(blob) {
+  const ctx = new AudioContext()
+  try {
+    const buf = await ctx.decodeAudioData(await blob.arrayBuffer())
+    const data = buf.getChannelData(0)
+    const step = Math.max(1, Math.floor(data.length / 64))
+    const vals = []
+    for (let i = 0; i < 64; i++) {
+      let sum = 0
+      for (let j = 0; j < step; j++) sum += Math.abs(data[i * step + j] || 0)
+      vals.push(sum / step)
+    }
+    const max = Math.max(...vals) || 1
+    return btoa(String.fromCharCode(...vals.map((v) => Math.round((v / max) * 100))))
+  } finally {
+    ctx.close()
+  }
+}
+
+$('mic').onclick = startRecording
+$('rec-cancel').onclick = () => stopRecording(true)
+$('rec-send').onclick = () => stopRecording(false)
+updateComposer()
 
 // ---------- atalhos e filtros ----------
 // E arquiva ou desarquiva a conversa aberta. Setas trocam de conversa.
@@ -649,6 +1022,8 @@ function onEvent(ev) {
       if (ev.live) setTimeout(markReadIfVisible, 50)
     }
     if (ev.live && !ev.updated) setTimeout(() => notify(m), 60)
+  } else if (ev.type === 'notes') {
+    reloadNotes().catch(() => {})
   } else if (ev.type === 'reload') {
     clearTimeout(reloadTimer)
     reloadTimer = setTimeout(async () => {
@@ -955,6 +1330,22 @@ async function loadNotes() {
   state.notes = notes
 }
 
+// O outro aparelho mudou alguma nota. A nota que você está editando agora não é
+// trocada: a sua edição é a mais recente e vai para o outro aparelho em seguida.
+async function reloadNotes() {
+  const { notes } = await api('/api/notes')
+  const open = curNote()
+  const editing = [editor, $('note-title')].includes(document.activeElement)
+  state.notes = notes.map((n) => (notePending && n.id === notePending.id ? notePending : n))
+  if (open && !state.notes.some((n) => n.id === open.id)) {
+    state.selectedNote = null
+    if (state.tab === 'notes') renderMain()
+  } else if (open && state.tab === 'notes' && !editing && notePending?.id !== open.id) {
+    renderNoteEditor()
+  }
+  if (state.tab === 'notes') renderList()
+}
+
 function noteSummary(n) {
   const doc = new DOMParser().parseFromString(`<body>${n.body || ''}</body>`, 'text/html')
   const tasks = [...doc.querySelectorAll('ul.checklist > li')].filter((li) => li.textContent.trim())
@@ -971,7 +1362,7 @@ function renderNotesList() {
   const box = $('list')
   box.replaceChildren()
   if (!state.notes.length) {
-    box.append(el('div', 'list-empty', 'No notes yet. Press ⌘N to create one.'))
+    box.append(el('div', 'list-empty', isPhone ? 'No notes yet. Tap ⋯ to create one.' : 'No notes yet. Press ⌘N to create one.'))
     return
   }
   for (const n of [...state.notes].sort((a, b) => b.updated - a.updated)) {
@@ -1127,7 +1518,7 @@ try {
 
 function applySide() {
   document.documentElement.style.setProperty('--side-w', `${sideW}px`)
-  document.body.classList.toggle('side-collapsed', sideCollapsed)
+  document.body.classList.toggle('side-collapsed', sideCollapsed && !narrow())
   try {
     localStorage.setItem('wc-side', JSON.stringify({ w: sideW, c: sideCollapsed }))
   } catch {}
@@ -1160,6 +1551,54 @@ $('side-resize').addEventListener('pointerdown', (e) => {
 })
 applySide()
 window.wc.toggleSidebar = toggleSidebar
+window.addEventListener('resize', applySide)
+
+// ---------- celular ----------
+// Voltar (botão do Android ou seta no topo): da conversa ou nota para a lista.
+// Devolve true quando tratou; false deixa o Android sair do app.
+function back() {
+  if (!$('dialog').hidden && $('dialog').open) {
+    $('dialog').close()
+    return true
+  }
+  if (!$('palette').hidden) {
+    closePalette()
+    return true
+  }
+  if (!narrow() || !document.body.classList.contains('show-main')) return false
+  if (state.tab === 'notes') {
+    flushNote()
+    state.selectedNote = null
+  } else {
+    state.selected = null
+    state.messages = []
+  }
+  showMain('empty')
+  renderList()
+  return true
+}
+for (const b of document.querySelectorAll('.back-btn')) b.onclick = back
+
+$('side-more').onclick = (e) => {
+  const r = e.currentTarget.getBoundingClientRect()
+  showMenu(r.left, r.bottom + 4, [
+    { label: 'New note', action: newNote },
+    { label: 'Find conversation', action: openPalette },
+    { label: 'Connect new account', action: connectNew },
+    { label: 'Accounts', action: () => showDialog({ mode: 'accounts' }) },
+    ...(window.Android?.addWidget ? [{ label: 'Add widget to home screen', action: () => window.Android.addWidget() }] : []),
+  ])
+}
+
+// Aberto por um aviso do Android: vai direto para a conversa.
+function openChatKey(k) {
+  const c = state.chats.get(k)
+  if (!c) return
+  const tab = c.archived ? 'archived' : 'inbox'
+  if (state.tab !== tab) document.querySelector(`#tabs button[data-tab="${tab}"]`).click()
+  openChat(k)
+}
+Object.assign(window.wc, { back, openChatKey })
 window.wc.newNote = newNote
 
 loadNotes().then(load).then(listen).catch((e) => {
