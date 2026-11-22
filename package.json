@@ -1,0 +1,25 @@
+{
+  "name": "whatsapp-central",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two WhatsApp numbers in one Mac app, with one inbox and auto-unarchive. Everything stays on your Mac.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "node server/index.js",
+    "demo": "WC_DEMO=1 node server/index.js",
+    "app": "electron .",
+    "package": "electron-packager . \"Whatsapp Central\" --platform=darwin --arch=arm64 --out=dist --overwrite --no-asar --app-bundle-id=local.whatsappcentral.app --icon=build/icon.icns --ignore='^/dist' --ignore='^/\\.git' --ignore='^/docs' --ignore='^/build/logo-options' && cp build/icon.icns \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app/Contents/Resources/electron.icns\" && touch \"dist/Whatsapp Central-darwin-arm64/Whatsapp Central.app\"",
+    "screenshots": "electron scripts/screenshots.cjs"
+  },
+  "dependencies": {
+    "baileys": "^7.0.0-rc14",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.4.1"
+  },
+  "productName": "Whatsapp Central",
+  "license": "MIT"
+}
