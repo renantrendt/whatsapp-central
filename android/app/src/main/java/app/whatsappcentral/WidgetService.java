@@ -15,12 +15,20 @@ import android.view.View;
 import android.widget.RemoteViews;
 import android.widget.RemoteViewsService;
 
+import android.content.pm.ResolveInfo;
+
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Fornece as linhas da lista do widget (uma por conversa não lida). */
 public class WidgetService extends RemoteViewsService {
@@ -36,8 +44,8 @@ public class WidgetService extends RemoteViewsService {
         private boolean notesTab = false;
         private List<UnreadWidget.Item> items = new ArrayList<>();
         private List<UnreadWidget.Note> notes = new ArrayList<>();
-        /** Fotos já baixadas, pela chave da conversa + versão da foto. */
-        private final Map<String, Bitmap> photos = new HashMap<>();
+        /** Link to each chat's round picture file, by chat key. */
+        private final Map<String, Uri> photos = new HashMap<>();
 
         Factory(Context ctx, int widgetId) {
             this.ctx = ctx;
@@ -57,13 +65,50 @@ public class WidgetService extends RemoteViewsService {
                 return;
             }
             items = UnreadWidget.loadUnread();
+            File dir = AvatarProvider.dir(ctx);
+            Set<String> keep = new HashSet<>();
+            List<String> hosts = homeApps();
+            photos.clear();
             for (UnreadWidget.Item it : items) {
-                String k = it.key + "#" + it.avatar;
-                if (it.avatar > 0 && !photos.containsKey(k)) photos.put(k, loadPhoto(it));
+                if (it.avatar <= 0) continue;
+                String name = fileName(it);
+                File f = new File(dir, name);
+                if (!f.isFile() && !savePhoto(it, f)) continue;
+                keep.add(name);
+                Uri uri = AvatarProvider.uriFor(name);
+                for (String pkg : hosts) {
+                    ctx.grantUriPermission(pkg, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                }
+                photos.put(it.key, uri);
+            }
+            // Old versions and chats no longer in the list.
+            File[] old = dir.listFiles();
+            if (old != null) for (File f : old) if (!keep.contains(f.getName())) f.delete();
+        }
+
+        /** The chat and the picture version, so a new picture gets a new link. */
+        private static String fileName(UnreadWidget.Item it) {
+            try {
+                byte[] h = MessageDigest.getInstance("SHA-1").digest(it.key.getBytes(StandardCharsets.UTF_8));
+                StringBuilder s = new StringBuilder();
+                for (byte b : h) s.append(String.format("%02x", b));
+                return s + "_" + it.avatar + ".png";
+            } catch (Exception e) {
+                return Integer.toHexString(it.key.hashCode()) + "_" + it.avatar + ".png";
             }
         }
 
-        private Bitmap loadPhoto(UnreadWidget.Item it) {
+        /** Home-screen apps that show the widget and must read the pictures. */
+        private List<String> homeApps() {
+            List<String> out = new ArrayList<>();
+            Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+            for (ResolveInfo r : ctx.getPackageManager().queryIntentActivities(home, 0)) {
+                out.add(r.activityInfo.packageName);
+            }
+            return out;
+        }
+
+        private boolean savePhoto(UnreadWidget.Item it, File f) {
             try {
                 HttpURLConnection c = NodeService.open("/api/avatar?account=" + Uri.encode(it.account)
                         + "&chat=" + Uri.encode(it.id));
@@ -72,9 +117,14 @@ public class WidgetService extends RemoteViewsService {
                 try (InputStream in = c.getInputStream()) {
                     src = BitmapFactory.decodeStream(in);
                 }
-                return src == null ? null : circle(src, 108);
+                if (src == null) return false;
+                File tmp = new File(f.getPath() + ".tmp");
+                try (FileOutputStream out = new FileOutputStream(tmp)) {
+                    circle(src, 108).compress(Bitmap.CompressFormat.PNG, 100, out);
+                }
+                return tmp.renameTo(f);
             } catch (Exception e) {
-                return null;
+                return false;
             }
         }
 
@@ -124,9 +174,9 @@ public class WidgetService extends RemoteViewsService {
             v.setViewVisibility(R.id.count, it.unread > 0 ? View.VISIBLE : View.GONE);
             String first = it.name.trim().isEmpty() ? "?" : it.name.trim().substring(0, 1).toUpperCase();
             v.setTextViewText(R.id.letter, first);
-            Bitmap photo = photos.get(it.key + "#" + it.avatar);
+            Uri photo = photos.get(it.key);
             if (photo != null) {
-                v.setImageViewBitmap(R.id.avatar, photo);
+                v.setImageViewUri(R.id.avatar, photo);
                 v.setViewVisibility(R.id.avatar, View.VISIBLE);
             } else {
                 v.setViewVisibility(R.id.avatar, View.GONE);

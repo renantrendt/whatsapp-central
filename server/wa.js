@@ -18,13 +18,42 @@ import { parseContent, rawOf, fromRaw, toSeconds } from './parse.js'
 import { prettyNumber } from './hub.js'
 
 const debug = !!process.env.WC_DEBUG
+
+// The WhatsApp Web version, fetched once every 6 hours instead of on every reconnect.
+let cachedVersion = null
+let cachedAt = 0
+async function webVersion() {
+  if (cachedVersion && Date.now() - cachedAt < 6 * 3600 * 1000) return cachedVersion
+  try {
+    const v = await fetchLatestWaWebVersion()
+    if (v?.version) {
+      cachedVersion = v.version
+      cachedAt = Date.now()
+    }
+  } catch {}
+  return cachedVersion || undefined
+}
 const logger = {
-  level: 'silent',
+  level: process.env.WC_TRACE_MATCH ? 'trace' : 'silent',
   child() {
     return logger
   },
-  trace() {},
-  debug() {},
+  trace(...a) {
+    // WC_TRACE_MATCH=text: print raw WhatsApp frames that contain this text, for diagnosis.
+    const want = process.env.WC_TRACE_MATCH
+    if (!want) return
+    let line
+    try {
+      line = JSON.stringify(a)
+    } catch {
+      return
+    }
+    if (line.includes(want)) console.error('[wa trace]', line.slice(0, 600))
+  },
+  debug(...a) {
+    // WC_TRACE=1: one line per event from the WhatsApp connection, for diagnosis.
+    if (process.env.WC_TRACE) console.error('[wa debug]', JSON.stringify(a).slice(0, 300))
+  },
   info() {},
   warn(...a) {
     if (debug) console.warn('[wa]', ...a)
@@ -102,10 +131,20 @@ export class WaAccount {
     }
   }
 
+  // Events are handled one at a time, in order. A step that never finishes would
+  // block every message after it, so each step gets 60 seconds at most.
   enqueue(fn) {
-    this.queue = this.queue.then(fn).catch((e) => {
-      if (debug) console.error('[wa handler]', e)
-    })
+    this.queue = this.queue
+      .then(() => {
+        let timer
+        const limit = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('handler took over 60 s, skipped')), 60000)
+        })
+        return Promise.race([Promise.resolve().then(fn), limit]).finally(() => clearTimeout(timer))
+      })
+      .catch((e) => {
+        if (debug || /over 60 s/.test(e?.message)) console.error(`[wa handler ${this.id}]`, e?.stack || e)
+      })
   }
 
   async canon(jid, alt) {
@@ -146,11 +185,7 @@ export class WaAccount {
     try {
       await fs.mkdir(this.authDir, { recursive: true })
       const { state, saveCreds } = await useMultiFileAuthState(this.authDir)
-      let version
-      try {
-        const v = await fetchLatestWaWebVersion()
-        if (v?.version) version = v.version
-      } catch {}
+      const version = await webVersion()
 
       this.set({ status: 'connecting', error: null })
       const sock = makeWASocket({
@@ -161,7 +196,8 @@ export class WaAccount {
         // não libera as fotos das pessoas, só as dos grupos.
         browser: Browsers.macOS('Desktop'),
         syncFullHistory: false,
-        markOnlineOnConnect: false, // o celular continua recebendo as notificações
+        // false: o celular continua recebendo as notificações. WC_ONLINE=1 liga, para teste.
+        markOnlineOnConnect: !!process.env.WC_ONLINE,
         generateHighQualityLinkPreview: false,
         getMessage: async (key) => {
           const row = this.store.findMessageById(this.id, key.id)
@@ -173,11 +209,17 @@ export class WaAccount {
       sock.ev.on('creds.update', saveCreds)
       sock.ev.on('connection.update', (u) => this.onConnection(sock, state, u))
       sock.ev.on('messaging-history.set', (h) => this.enqueue(() => this.onHistory(h)))
-      sock.ev.on('messages.upsert', ({ messages, type }) =>
-        this.enqueue(async () => {
+      sock.ev.on('messages.upsert', ({ messages, type }) => {
+        if (debug) {
+          for (const m of messages) {
+            const c = m.message ? Object.keys(m.message).join(',') : '-'
+            console.log(`[wa ${this.id}] upsert ${type} ${m.key?.remoteJid} stub=${m.messageStubType ?? ''} ${m.messageStubParameters?.[0] ?? ''} ${c}`)
+          }
+        }
+        return this.enqueue(async () => {
           for (const m of messages) await this.onMessage(m, type === 'notify')
         })
-      )
+      })
       sock.ev.on('messages.update', (updates) =>
         this.enqueue(async () => {
           for (const u of updates) await this.onMessageUpdate(u)
@@ -248,7 +290,11 @@ export class WaAccount {
         error: null,
         me: prettyNumber(sock.user?.id || ''),
       })
-      this.enqueue(() => this.loadGroupNames())
+      // Group names change rarely: reload them at most once an hour, not on every reconnect.
+      if (Date.now() - (this.groupsAt || 0) > 3600 * 1000) {
+        this.groupsAt = Date.now()
+        this.enqueue(() => this.loadGroupNames())
+      }
     }
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode

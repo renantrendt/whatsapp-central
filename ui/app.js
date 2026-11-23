@@ -469,7 +469,7 @@ function renderChatHead() {
   if (state.accounts.length > 1) parts.push(`via ${accountOf(c.account)?.me || 'offline account'}`)
   if (c.archived) parts.push('Archived')
   $('chat-sub').textContent = parts.join(' - ')
-  $('chat-call').hidden = !state.calls
+  $('chat-call').hidden = !state.calls && !window.Android?.call
 }
 
 const mediaUrl = (m) =>
@@ -859,6 +859,12 @@ $('chat-call').onclick = async () => {
   const c = state.chats.get(state.selected)
   if (!c) return
   try {
+    // Android: the call runs in the official WhatsApp app for this number.
+    if (window.Android?.call) {
+      const { phone } = await api('/api/phone-for', { account: c.account, chat: c.id })
+      window.Android.call(accountOf(c.account)?.me || '', phone || '')
+      return
+    }
     const r = await api('/api/call', { account: c.account, chat: c.id })
     if (!r.phone) alert('The calls window is open. Find this conversation there and tap the call button.')
   } catch (e) {

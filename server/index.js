@@ -115,6 +115,62 @@ if (!demo) {
   }
 }
 
+// Linking a number again creates a new account id, and the old id keeps its chats,
+// so every chat showed twice. This moves the old rows to the new account. An old id
+// is one with no login folder; its new account is the linked one sharing most chats.
+// Rows the new account already has are kept, the old copies are dropped.
+// Only the local database and files change, never the WhatsApp connection.
+async function mergeRelinked() {
+  if (demo) return
+  const live = [...accounts.values()].filter((a) => a.status === 'open')
+  if (!live.length) return
+  const olds = store.db.prepare('SELECT DISTINCT account FROM chats').all().map((r) => r.account)
+  const shared = store.db.prepare(
+    'SELECT count(*) AS n FROM chats WHERE account = ? AND id IN (SELECT id FROM chats WHERE account = ?)'
+  )
+  for (const old of olds) {
+    if (accounts.has(old)) continue
+    const size = store.db.prepare('SELECT count(*) AS n FROM chats WHERE account = ?').get(old).n
+    const scores = live.map((a) => ({ a, n: shared.get(a.id, old).n })).sort((x, y) => y.n - x.n)
+    const [best, second] = scores
+    // Clear winner only: groups can be shared by both numbers.
+    if (!best || best.n < Math.min(20, Math.ceil(size / 2)) || (second && best.n < 2 * second.n)) continue
+    const to = best.a.id
+    hub.quietly(() => {
+      for (const t of ['messages', 'reactions', 'contacts']) {
+        store.db.prepare(`UPDATE OR IGNORE ${t} SET account = ? WHERE account = ?`).run(to, old)
+        store.db.prepare(`DELETE FROM ${t} WHERE account = ?`).run(old)
+      }
+      // A chat both have: keep the new row, but keep the old photo if the new one has none.
+      store.db
+        .prepare(
+          `UPDATE chats SET avatar = (SELECT o.avatar FROM chats o WHERE o.account = ? AND o.id = chats.id)
+           WHERE account = ? AND avatar = 0 AND id IN (SELECT id FROM chats WHERE account = ? AND avatar > 0)`
+        )
+        .run(old, to, old)
+      store.db.prepare('UPDATE OR IGNORE chats SET account = ? WHERE account = ?').run(to, old)
+      store.db.prepare('DELETE FROM chats WHERE account = ?').run(old)
+    })
+    // Saved photos, videos and profile pictures: move the files the new account lacks.
+    for (const kind of ['media', 'avatars']) {
+      const from = path.join(dataDir, kind, old)
+      const dest = path.join(dataDir, kind, to)
+      const files = await fsp.readdir(from).catch(() => null)
+      if (!files) continue
+      await fsp.mkdir(dest, { recursive: true })
+      for (const f of files) {
+        const target = path.join(dest, f)
+        if (!fs.existsSync(target)) await fsp.rename(path.join(from, f), target).catch(() => {})
+      }
+      await fsp.rm(from, { recursive: true, force: true })
+    }
+    console.log(`[merge] moved ${size} chats of an old login to the relinked account (${best.n} shared)`)
+  }
+}
+// History arrives a while after linking, so check again every 10 minutes.
+setTimeout(() => mergeRelinked().catch((e) => console.error('[merge]', e)), 120000).unref?.()
+setInterval(() => mergeRelinked().catch((e) => console.error('[merge]', e)), 600000).unref?.()
+
 // Contas já ligadas reconectam sozinhas. Pastas de contas nunca ligadas são removidas.
 for (const a of [...accounts.values()]) {
   if (await a.isLinked()) a.connect()
@@ -396,6 +452,12 @@ const server = http.createServer(async (req, res) => {
       const acc = accounts.get(body.account)
       if (!acc) return json(res, 400, { error: 'unknown account' })
 
+      // The other person's phone number, for the Android call button (null for groups).
+      if (p === '/api/phone-for') {
+        const chat = String(body.chat || '')
+        const phone = chat && !chat.endsWith('@g.us') ? await acc.phoneFor(chat) : null
+        return json(res, 200, { phone })
+      }
       if (p === '/api/call' || p === '/api/calls/setup') {
         if (!callsAvailable) return json(res, 400, { error: 'Calls are only available in the Mac app.' })
         const phone = p === '/api/call' && body.chat ? await acc.phoneFor(String(body.chat)) : null

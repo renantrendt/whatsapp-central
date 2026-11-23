@@ -5,6 +5,9 @@ import android.app.Activity;
 import android.app.NotificationManager;
 import android.appwidget.AppWidgetManager;
 import android.content.ComponentName;
+import android.content.ContentUris;
+import android.database.Cursor;
+import android.provider.ContactsContract;
 import android.widget.Toast;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -38,6 +41,7 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> pendingFiles;
     private static final int REQ_MIC = 2;
     private static final int REQ_FILES = 3;
+    private static final int REQ_CONTACTS = 4;
 
     @Override
     protected void onCreate(Bundle saved) {
@@ -147,9 +151,86 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    // ---------- calls ----------
+    // This app cannot carry call audio. The call runs in the official app that holds
+    // the number: the +55 number is in WhatsApp, the other number in WhatsApp Business.
+    private String[] pendingCall;
+
+    private static boolean installed(PackageManager pm, String pkg) {
+        try {
+            pm.getPackageInfo(pkg, 0);
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    void startCall(String own, String phone) {
+        startCall(own, phone, true);
+    }
+
+    void startCall(String own, String phone, boolean useContacts) {
+        String digits = phone.replaceAll("\\D", "");
+        PackageManager pm = getPackageManager();
+        String pkg = own.replaceAll("\\D", "").startsWith("55") ? "com.whatsapp" : "com.whatsapp.w4b";
+        if (!installed(pm, pkg)) pkg = pkg.equals("com.whatsapp") ? "com.whatsapp.w4b" : "com.whatsapp";
+        if (!installed(pm, pkg)) {
+            Toast.makeText(this, "WhatsApp is not installed.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        // Each WhatsApp app adds a "call" entry to the phone's contacts. Opening that
+        // entry starts the call at once. It needs permission to read contacts.
+        if (useContacts && !digits.isEmpty() && checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+            pendingCall = new String[]{own, phone};
+            requestPermissions(new String[]{Manifest.permission.READ_CONTACTS}, REQ_CONTACTS);
+            return;
+        }
+        if (useContacts && !digits.isEmpty()) {
+            String mime = "com.whatsapp".equals(pkg)
+                    ? "vnd.android.cursor.item/vnd.com.whatsapp.voip.call"
+                    : "vnd.android.cursor.item/vnd.com.whatsapp.w4b.voip.call";
+            try (Cursor c = getContentResolver().query(ContactsContract.Data.CONTENT_URI,
+                    new String[]{ContactsContract.Data._ID},
+                    ContactsContract.Data.MIMETYPE + "=? AND " + ContactsContract.Data.DATA1 + "=?",
+                    new String[]{mime, digits + "@s.whatsapp.net"}, null)) {
+                if (c != null && c.moveToFirst()) {
+                    Intent i = new Intent(Intent.ACTION_VIEW);
+                    i.setDataAndType(ContentUris.withAppendedId(ContactsContract.Data.CONTENT_URI, c.getLong(0)), mime);
+                    i.setPackage(pkg);
+                    startActivity(i);
+                    return;
+                }
+            } catch (Exception ignored) {
+                // Falls back to opening the chat below.
+            }
+        }
+        // Not a saved contact, or a group: open the chat (or the app) and tap call there.
+        Intent open;
+        if (!digits.isEmpty()) {
+            open = new Intent(Intent.ACTION_VIEW, Uri.parse("https://api.whatsapp.com/send?phone=" + digits));
+            open.setPackage(pkg);
+            Toast.makeText(this, "Tap the call button in WhatsApp.", Toast.LENGTH_SHORT).show();
+        } else {
+            open = pm.getLaunchIntentForPackage(pkg);
+            Toast.makeText(this, "Group calls start in WhatsApp: open the group and tap call.", Toast.LENGTH_LONG).show();
+        }
+        try {
+            startActivity(open);
+        } catch (Exception e) {
+            Toast.makeText(this, "Could not open WhatsApp.", Toast.LENGTH_LONG).show();
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
+        if (code == REQ_CONTACTS && pendingCall != null) {
+            String[] p = pendingCall;
+            pendingCall = null;
+            // Without contacts access, the chat opens and you tap call there.
+            startCall(p[0], p[1], results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED);
+            return;
+        }
         if (code == REQ_MIC && pendingMic != null) {
             if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
                 pendingMic.grant(new String[]{PermissionRequest.RESOURCE_AUDIO_CAPTURE});
@@ -233,6 +314,12 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void addWidget() {
             runOnUiThread(MainActivity.this::pinWidget);
+        }
+
+        /** Call button: own number of the account, the other person's number ("" for groups). */
+        @JavascriptInterface
+        public void call(String own, String phone) {
+            runOnUiThread(() -> startCall(own, phone));
         }
 
         @JavascriptInterface
