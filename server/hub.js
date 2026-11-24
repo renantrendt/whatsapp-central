@@ -152,6 +152,11 @@ export function createHub(store) {
       if (info.name) patch.name = info.name
       if (typeof info.archived === 'boolean') patch.archived = info.archived ? 1 : 0
       if (typeof info.unread === 'number') patch.unread = Math.max(0, info.unread)
+      // Archived or read on another device: the user has dealt with what is stored here.
+      if (info.archived === true || info.unread === 0) {
+        const cur = store.getChat(account, id)
+        patch.seen_ts = Math.max(cur.seen_ts || 0, cur.last_ts || 0)
+      }
       if (info.markedUnread) patch.unread = Math.max(1, store.getChat(account, id).unread)
       if (info.lastTs) {
         const cur = store.getChat(account, id)
@@ -175,8 +180,11 @@ export function createHub(store) {
     },
 
     // Entrada de uma mensagem já traduzida (ver parse.js).
-    // live = chegou agora (ou enquanto o app estava fechado), não é histórico antigo.
-    ingest(account, p, { live }) {
+    // live = arrived now, while connected.
+    // offline = WhatsApp held it while this app was disconnected (or while the
+    //   server was holding messages back) and delivered it after a reconnect.
+    // Neither = old history.
+    ingest(account, p, { live, offline }) {
       const chatId = p.chatId
 
       if (p.kind === 'reaction') {
@@ -227,8 +235,17 @@ export function createHub(store) {
         patch.last_from_me = p.fromMe ? 1 : 0
       }
 
+      // A late message is new for the user when it is the newest in the chat and
+      // newer than what the user already dealt with (read, answered, archived).
+      // Before, late messages were stored as old history: no unread count, no
+      // return to the inbox and no notification.
+      const newest = p.ts >= chat.last_ts
+      const late = !!offline && newest && p.ts > (chat.seen_ts || 0)
+      const fresh = !p.fromMe && (!!live || late)
+      const ageSec = Math.floor(Date.now() / 1000) - p.ts
+
       let unarchived = false
-      if (live && !p.fromMe) {
+      if (fresh) {
         patch.unread = chat.unread + 1
         if (chat.archived) {
           patch.archived = 0
@@ -236,16 +253,24 @@ export function createHub(store) {
         }
       }
       // Resposta enviada por mim (daqui ou do celular) zera o contador.
-      if (live && p.fromMe && chat.unread) patch.unread = 0
+      if (p.fromMe && (live || (offline && newest))) {
+        if (chat.unread) patch.unread = 0
+        patch.seen_ts = Math.max(chat.seen_ts || 0, p.ts)
+      }
 
       store.patchChat(account, chatId, patch)
       const row = store.getMessage(account, chatId, p.id)
-      emit({ type: 'message', message: viewMessage(row), live: !!live })
+      // "live" makes the phone and the Mac show a notification. A late message
+      // gets one only when it is under 6 hours old.
+      emit({ type: 'message', message: viewMessage(row), live: !!live || (fresh && ageSec < 6 * 3600) })
       chatChanged(account, chatId)
 
-      if (unarchived) {
+      // Tell WhatsApp the chat left the archive. For a late message only when it
+      // is recent: an older one may be followed by an archive done on the phone.
+      if (unarchived && (live || ageSec < 600)) {
         pushers.get(account)?.archive(chatId, false).catch(() => {})
       }
+      return fresh
     },
 
     // Pedido feito na tela.
@@ -253,7 +278,10 @@ export function createHub(store) {
       const chat = store.getChat(account, chatId)
       if (!chat) return
       const patch = { archived: archived ? 1 : 0 }
-      if (archived) patch.unread = 0
+      if (archived) {
+        patch.unread = 0
+        patch.seen_ts = Math.max(chat.seen_ts || 0, chat.last_ts || 0)
+      }
       store.patchChat(account, chatId, patch)
       chatChanged(account, chatId)
       await pushers.get(account)?.archive(chatId, archived).catch(() => {})
@@ -263,9 +291,20 @@ export function createHub(store) {
       const chat = store.getChat(account, chatId)
       if (!chat || !chat.unread) return
       const count = chat.unread
-      store.patchChat(account, chatId, { unread: 0 })
+      store.patchChat(account, chatId, { unread: 0, seen_ts: Math.max(chat.seen_ts || 0, chat.last_ts || 0) })
       chatChanged(account, chatId)
       await pushers.get(account)?.read?.(chatId, count).catch(() => {})
+    },
+
+    // The user read this chat on another device (the phone's WhatsApp, or the
+    // other copy of this app), up to the message with time ts.
+    readElsewhere(account, chatId, ts) {
+      const chat = store.getChat(account, chatId)
+      if (!chat || ts <= (chat.seen_ts || 0)) return
+      const patch = { seen_ts: ts }
+      if (chat.unread) patch.unread = Math.min(chat.unread, store.countIncomingAfter(account, chatId, ts))
+      store.patchChat(account, chatId, patch)
+      if (patch.unread !== undefined && patch.unread !== chat.unread) chatChanged(account, chatId)
     },
 
     accountsChanged(accounts) {

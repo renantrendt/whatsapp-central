@@ -5,9 +5,15 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
+import net from 'node:net'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { webcrypto } from 'node:crypto'
+
+// Node 20 and newer try each address of a host for only 250 ms before giving up.
+// On a slow link (phone hotspot) every download from WhatsApp then failed with
+// "fetch failed" (ETIMEDOUT), as seen on the Mac on 23/11. Give each try 2.5 s.
+net.setDefaultAutoSelectFamilyAttemptTimeout?.(2500)
 
 // O Node 18 (usado no Android) não expõe globalThis.crypto, que a biblioteca de WhatsApp usa.
 if (!globalThis.crypto) globalThis.crypto = webcrypto
@@ -34,6 +40,7 @@ if (process.env.WC_MOBILE) {
 import { openStore } from './store.js'
 import { createHub, previewOf } from './hub.js'
 import { startSync } from './sync.js'
+import { createDiag, noDiag } from './diag.js'
 import { webmToOgg } from './ogg.js'
 import { EventEmitter } from 'node:events'
 
@@ -47,6 +54,14 @@ const dataDir =
 
 if (!demo) fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
 const store = await openStore(demo ? ':memory:' : path.join(dataDir, 'app.db'))
+// Event recorder for the connections (see diag.js). Read it at /api/diag.
+const diag = demo ? noDiag : createDiag(dataDir)
+diag.log('-', 'boot', { mobile: !!process.env.WC_MOBILE, node: process.version })
+if (process.env.WC_MOBILE) {
+  const brief = (e) => String(e?.stack || e).replace(/\d{8,}/g, '<n>').slice(0, 300)
+  process.on('uncaughtException', (e) => diag.log('-', 'uncaught', { err: brief(e) }))
+  process.on('unhandledRejection', (e) => diag.log('-', 'unhandled', { err: brief(e) }))
+}
 const hub = createHub(store)
 // Sincronização das notas com o outro aparelho (não roda no modo de demonstração).
 const sync = demo ? null : startSync({ store, onNotesChanged: () => hub.events.emit('event', { type: 'notes' }) })
@@ -71,7 +86,7 @@ if (demo) {
   // Cada pasta dentro de auth/ é uma conta já criada neste Mac.
   const dirs = await fsp.readdir(path.join(dataDir, 'auth')).catch(() => [])
   for (const id of dirs) {
-    if (/^[a-z0-9]+$/i.test(id)) accounts.set(id, new WaAccount({ id, dataDir, hub, store, onChange }))
+    if (/^[a-z0-9]+$/i.test(id)) accounts.set(id, new WaAccount({ id, dataDir, hub, store, onChange, diag }))
   }
 }
 
@@ -116,8 +131,15 @@ if (!demo) {
 }
 
 // Linking a number again creates a new account id, and the old id keeps its chats,
-// so every chat showed twice. This moves the old rows to the new account. An old id
-// is one with no login folder; its new account is the linked one sharing most chats.
+// so every chat showed twice. This moves the old rows to the new account.
+// An old id is one whose login folder is gone. It is merged only into a login of
+// the SAME phone number. Two tests, in this order:
+// 1. Both numbers are known (each login saves its number when it connects):
+//    they must be equal.
+// 2. A number is unknown: the two logins must share messages inside one-to-one
+//    chats. Such a chat belongs to one number only, so two different numbers
+//    never share its messages. (They do share group chats. Counting shared chats
+//    was the old rule, and on 24/11 it moved one number's chats into the other.)
 // Rows the new account already has are kept, the old copies are dropped.
 // Only the local database and files change, never the WhatsApp connection.
 async function mergeRelinked() {
@@ -125,16 +147,33 @@ async function mergeRelinked() {
   const live = [...accounts.values()].filter((a) => a.status === 'open')
   if (!live.length) return
   const olds = store.db.prepare('SELECT DISTINCT account FROM chats').all().map((r) => r.account)
-  const shared = store.db.prepare(
-    'SELECT count(*) AS n FROM chats WHERE account = ? AND id IN (SELECT id FROM chats WHERE account = ?)'
+  const numOf = (id) => store.getSetting(`num:${id}`)
+  // Shared messages in the old login's 50 most recent one-to-one chats.
+  const sharedDirect = store.db.prepare(
+    `SELECT count(*) AS n FROM messages o
+       JOIN messages n ON n.account = ? AND n.chat_id = o.chat_id AND n.id = o.id
+      WHERE o.account = ? AND o.chat_id IN (
+        SELECT id FROM chats WHERE account = ? AND is_group = 0 ORDER BY last_ts DESC LIMIT 50)`
   )
   for (const old of olds) {
-    if (accounts.has(old)) continue
+    const gone = accounts.get(old)
+    // Still a login here (linked, or waiting for its QR code): not an old id.
+    if (gone && (gone.status !== 'idle' || fs.existsSync(path.join(dataDir, 'auth', old)))) continue
     const size = store.db.prepare('SELECT count(*) AS n FROM chats WHERE account = ?').get(old).n
-    const scores = live.map((a) => ({ a, n: shared.get(a.id, old).n })).sort((x, y) => y.n - x.n)
-    const [best, second] = scores
-    // Clear winner only: groups can be shared by both numbers.
-    if (!best || best.n < Math.min(20, Math.ceil(size / 2)) || (second && best.n < 2 * second.n)) continue
+    const oldNum = numOf(old)
+    let best = null
+    for (const a of live) {
+      if (a.id === old) continue
+      const num = numOf(a.id)
+      if (oldNum && num) {
+        if (oldNum !== num) continue
+        best = { a, n: -1 }
+        break
+      }
+      const n = sharedDirect.get(a.id, old, old).n
+      if (n >= 5 && (!best || n > best.n)) best = { a, n }
+    }
+    if (!best) continue
     const to = best.a.id
     hub.quietly(() => {
       for (const t of ['messages', 'reactions', 'contacts']) {
@@ -164,7 +203,12 @@ async function mergeRelinked() {
       }
       await fsp.rm(from, { recursive: true, force: true })
     }
-    console.log(`[merge] moved ${size} chats of an old login to the relinked account (${best.n} shared)`)
+    if (gone) {
+      accounts.delete(old)
+      onChange()
+    }
+    diag.log(to, 'merge', { from: old, chats: size, by: best.n < 0 ? 'same number' : `${best.n} shared direct messages` })
+    console.log(`[merge] moved ${size} chats of an old login to the relinked account`)
   }
 }
 // History arrives a while after linking, so check again every 10 minutes.
@@ -328,6 +372,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { accounts: accountViews(), chats, demo, calls: callsAvailable })
     }
 
+    // The event recorder, newest lines last (see diag.js). No message text in it.
+    if (req.method === 'GET' && p === '/api/diag') {
+      diag.flush()
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+      return res.end(`${diag.tail(Number(arg('n')) || 800).join('\n')}\n`)
+    }
+
     if (req.method === 'GET' && p === '/api/notes') {
       return json(res, 200, { notes: store.listNotes() })
     }
@@ -411,13 +462,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST') {
       const body = await readBody(req)
 
+      // The phone screen turned on, or the app window came to the front: each
+      // account tests its connection now (one ping). See WaAccount.wake.
+      if (p === '/api/wake') {
+        for (const a of accounts.values()) a.wake?.().catch(() => {})
+        return json(res, 200, { ok: true })
+      }
+
       if (p === '/api/connect-new') {
         if (demo) return json(res, 400, { error: 'Not available in demo mode.' })
         // Reaproveita uma conta que ainda está esperando o QR code.
         let acc = [...accounts.values()].find((a) => !a.me && a.status !== 'open')
         if (!acc) {
           const id = `a${Date.now().toString(36)}`
-          acc = new WaAccount({ id, dataDir, hub, store, onChange })
+          acc = new WaAccount({ id, dataDir, hub, store, onChange, diag })
           accounts.set(id, acc)
         }
         acc.connect(digits(body.phone))

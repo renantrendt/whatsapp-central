@@ -5,6 +5,9 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
@@ -62,6 +65,35 @@ public class NodeService extends Service {
     private final Map<String, String> chatNames = new ConcurrentHashMap<>();
     private Thread listener;
 
+    /**
+     * The screen turned on or the phone was unlocked: the server tests its
+     * WhatsApp connections now (one ping each). A connection that died while the
+     * phone slept is then replaced at once, so the widget is current when looked at.
+     */
+    private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            new Thread(NodeService::wakeServer, "wake").start();
+        }
+    };
+
+    static void wakeServer() {
+        try {
+            HttpURLConnection c = open("/api/wake");
+            c.setRequestMethod("POST");
+            c.setReadTimeout(5000);
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            try (OutputStream out = c.getOutputStream()) {
+                out.write("{}".getBytes(StandardCharsets.UTF_8));
+            }
+            c.getResponseCode();
+            c.disconnect();
+        } catch (Exception ignored) {
+            // The server is still starting: nothing to test yet.
+        }
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -80,6 +112,23 @@ public class NodeService extends Service {
         } else {
             startForeground(1, n);
         }
+
+        IntentFilter wake = new IntentFilter(Intent.ACTION_SCREEN_ON);
+        wake.addAction(Intent.ACTION_USER_PRESENT);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(wakeReceiver, wake, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(wakeReceiver, wake);
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        try {
+            unregisterReceiver(wakeReceiver);
+        } catch (Exception ignored) {
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -207,7 +256,12 @@ public class NodeService extends Service {
         String type = ev.optString("type");
         if (type.equals("chat")) {
             JSONObject ch = ev.getJSONObject("chat");
-            chatNames.put(ch.getString("account") + "|" + ch.getString("id"), ch.getString("name"));
+            String chatKey = ch.getString("account") + "|" + ch.getString("id");
+            chatNames.put(chatKey, ch.getString("name"));
+            // Nothing unread any more (read here or on another device): its notice goes away.
+            if (ch.optInt("unread", 1) == 0 && lines.remove(chatKey) != null) {
+                getSystemService(NotificationManager.class).cancel(chatKey.hashCode());
+            }
             UnreadWidget.refreshSoon(this);
             return;
         }

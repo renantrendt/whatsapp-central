@@ -669,6 +669,20 @@ function markReadIfVisible() {
 }
 window.addEventListener('focus', markReadIfVisible)
 
+// The window came back to the front: ask the server to test its connections now
+// (one ping each). A connection that died while the device slept is then
+// replaced at once, and held messages arrive without waiting.
+let lastWake = 0
+const wakeNow = () => {
+  if (Date.now() - lastWake < 10000) return
+  lastWake = Date.now()
+  api('/api/wake', {}).catch(() => {})
+}
+window.addEventListener('focus', wakeNow)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') wakeNow()
+})
+
 // ---------- escrever ----------
 const input = $('input')
 input.addEventListener('input', () => {

@@ -16,8 +16,41 @@ import makeWASocket, {
 } from 'baileys'
 import { parseContent, rawOf, fromRaw, toSeconds } from './parse.js'
 import { prettyNumber } from './hub.js'
+import { noDiag } from './diag.js'
 
 const debug = !!process.env.WC_DEBUG
+
+// The event recorder (see diag.js). Set by the first account created.
+let diagRef = noDiag
+// Library warnings and errors are counted by their text. A few are recorded in
+// full. Every number in the text becomes "#": some warnings carry a contact's
+// phone number, and the same warning then counts under one name.
+function note(level, a) {
+  const text = a.filter((x) => typeof x === 'string').pop()
+  if (!text) return
+  const msg = text.replace(/\d+/g, '#')
+  diagRef.count('-', `${level}: ${msg.slice(0, 70)}`)
+  if (/failed to sync|app state|App state|giving up|keep alive|timed out/.test(msg)) {
+    const o = a.find((x) => x && typeof x === 'object') || {}
+    const err = String(o.error || o.err?.message || o.trace || '').replace(/\d{8,}/g, '<n>').slice(0, 100)
+    diagRef.log('-', 'lib', { level, m: msg.slice(0, 100), name: o.name, code: o.statusCode, err: err || undefined })
+  }
+}
+// Short text for the recorder: no long numbers (they could be phone numbers).
+// Short numbers stay, since quotas and times in seconds are the point.
+const brief = (v) => {
+  let t = ''
+  try {
+    t = typeof v === 'string' ? v : JSON.stringify(v)
+  } catch {}
+  return String(t || '').replace(/\d{11,}/g, '<n>').slice(0, 400)
+}
+// Top-level stanza types this app or the library answers. Any other type is
+// recorded, because an unanswered type makes the server hold messages back.
+const KNOWN_TAGS = new Set([
+  'iq', 'message', 'receipt', 'notification', 'ack', 'ib', 'success', 'failure',
+  'stream:error', 'call', 'presence', 'chatstate', 'status', 'xmlstreamend',
+])
 
 // The WhatsApp Web version, fetched once every 6 hours instead of on every reconnect.
 let cachedVersion = null
@@ -56,9 +89,11 @@ const logger = {
   },
   info() {},
   warn(...a) {
+    note('warn', a)
     if (debug) console.warn('[wa]', ...a)
   },
   error(...a) {
+    note('error', a)
     if (debug) console.error('[wa]', ...a)
   },
   fatal(...a) {
@@ -76,10 +111,13 @@ const skipJid = (jid) =>
   !jid || jid === 'status@broadcast' || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')
 
 export class WaAccount {
-  constructor({ id, dataDir, hub, store, onChange }) {
+  constructor({ id, dataDir, hub, store, onChange, diag }) {
     this.id = id
     this.hub = hub
     this.store = store
+    this.diag = diag || noDiag
+    diagRef = this.diag
+    this.unknownTags = new Map()
     this.onChange = onChange
     this.authDir = path.join(dataDir, 'auth', id)
     this.mediaDir = path.join(dataDir, 'media', id)
@@ -205,24 +243,43 @@ export class WaAccount {
         },
       })
       this.sock = sock
+      this.diag.log(this.id, 'conn', { s: 'connecting' })
 
+      sock.ws.on('frame', (frame) => this.onFrame(sock, frame))
+      sock.ws.on('CB:status', (node) => this.ackStatus(sock, node))
+      // WhatsApp's limit on messages to new chats, when the server reports a change.
+      sock.ev.on('message-capping.update', (p) => this.diag.log(this.id, 'newchat-cap', { info: brief(p) }))
       sock.ev.on('creds.update', saveCreds)
       sock.ev.on('connection.update', (u) => this.onConnection(sock, state, u))
       sock.ev.on('messaging-history.set', (h) => this.enqueue(() => this.onHistory(h)))
       sock.ev.on('messages.upsert', ({ messages, type }) => {
+        this.diag.count(this.id, `upsert ${type}`, messages.length)
         if (debug) {
           for (const m of messages) {
             const c = m.message ? Object.keys(m.message).join(',') : '-'
             console.log(`[wa ${this.id}] upsert ${type} ${m.key?.remoteJid} stub=${m.messageStubType ?? ''} ${m.messageStubParameters?.[0] ?? ''} ${c}`)
           }
         }
+        // "notify" = arrived while connected. "append" = WhatsApp held it and
+        // delivered it after a reconnect; the hub decides whether it is still new.
         return this.enqueue(async () => {
-          for (const m of messages) await this.onMessage(m, type === 'notify')
+          for (const m of messages) await this.onMessage(m, type === 'notify', type === 'append')
         })
       })
       sock.ev.on('messages.update', (updates) =>
         this.enqueue(async () => {
           for (const u of updates) await this.onMessageUpdate(u)
+        })
+      )
+      // Read receipts of group messages. Only the user's own are used here:
+      // they mean the user read the group on another device.
+      sock.ev.on('message-receipt.update', (list) =>
+        this.enqueue(async () => {
+          for (const r of list || []) {
+            if (!r?.receipt?.readTimestamp || !r.key?.remoteJid || !r.key.id || skipJid(r.key.remoteJid)) continue
+            if (!this.isMe(sock, r.receipt.userJid)) continue
+            this.readElsewhere(await this.canon(r.key.remoteJid, r.key.remoteJidAlt), r.key.id)
+          }
         })
       )
       // Ligação chegando: o app do Mac abre a janela de ligações desse número.
@@ -261,8 +318,17 @@ export class WaAccount {
     }
   }
 
-  async onConnection(sock, state, { connection, lastDisconnect, qr }) {
+  async onConnection(sock, state, { connection, lastDisconnect, qr, reachoutTimeLock }) {
     if (sock !== this.sock) return
+    // WhatsApp's "reachout timelock": a restriction it puts on a number that
+    // messages people it sees as strangers. One form removes every linked device.
+    if (reachoutTimeLock) {
+      this.diag.log(this.id, 'timelock', {
+        active: !!reachoutTimeLock.isActive,
+        type: reachoutTimeLock.enforcementType,
+        ends: reachoutTimeLock.timeEnforcementEnds ? new Date(reachoutTimeLock.timeEnforcementEnds).toISOString() : undefined,
+      })
+    }
     if (qr) {
       if (this.pairPhone) {
         // Ligação por número: o WhatsApp devolve um código de 8 letras para digitar
@@ -284,6 +350,20 @@ export class WaAccount {
       this.retries = 0
       this.pairPhone = null
       this.pairCode = null
+      this.diag.log(this.id, 'conn', { s: 'open' })
+      // The number of this account, kept so that a later new login of the same
+      // number can be matched to this account's chats (see mergeRelinked).
+      const num = String(sock.user?.id || '').split('@')[0].split(':')[0]
+      if (/^\d{8,}$/.test(num)) this.store.setSetting(`num:${this.id}`, num)
+      // Ask WhatsApp whether this number is restricted and how much of its
+      // new-chat quota is used. Both answers go to the recorder.
+      setTimeout(() => {
+        if (sock !== this.sock) return
+        sock.fetchAccountReachoutTimelock?.().catch((e) => this.diag.log(this.id, 'timelock-query-failed', { err: brief(e?.message) }))
+        sock.fetchNewChatMessageCap?.()
+          .then((r) => this.diag.log(this.id, 'newchat-cap', { info: brief(r) }))
+          .catch((e) => this.diag.log(this.id, 'newchat-cap-query-failed', { err: brief(e?.message) }))
+      }, 8000)
       this.set({
         status: 'open',
         qr: null,
@@ -300,6 +380,17 @@ export class WaAccount {
       const code = lastDisconnect?.error?.output?.statusCode
       this.sock = null
       const linked = !!state.creds.me
+      // Why the connection ended. For a server stream error, the node it named
+      // (for example the unanswered stanza: class, type and id).
+      const why = lastDisconnect?.error?.data
+      this.diag.log(this.id, 'conn', {
+        s: 'close',
+        code,
+        m: String(lastDisconnect?.error?.message || '').slice(0, 60),
+        node: why?.tag,
+        ...(why?.attrs ? { class: why.attrs.class, type: why.attrs.type, id: why.attrs.id } : {}),
+      })
+      this.diag.flush()
 
       if (code === DisconnectReason.loggedOut) {
         await fs.rm(this.authDir, { recursive: true, force: true })
@@ -553,14 +644,141 @@ export class WaAccount {
     }
   }
 
-  async onMessage(m, live) {
+  async onMessage(m, live, offline) {
     const p = await this.translate(m)
-    if (p) this.hub.ingest(this.id, p, { live })
+    if (!p) return
+    const fresh = this.hub.ingest(this.id, p, { live, offline })
+    if (fresh && offline) this.diag.count(this.id, 'late message shown as new')
+  }
+
+  // Every frame from the server passes here. Only counts and a few facts are
+  // recorded (see diag.js): no text and no phone numbers.
+  onFrame(sock, frame) {
+    if (sock !== this.sock || !frame || frame instanceof Uint8Array || !frame.tag) return
+    this.lastFrameAt = Date.now()
+    const { tag, attrs = {}, content } = frame
+    this.diag.count(this.id, `rx ${tag}`)
+    if (attrs.offline) this.diag.count(this.id, 'rx offline')
+    // Kinds of server notices (device list changes, settings sync and so on),
+    // counted by type. They show what came before an unlink.
+    if (tag === 'notification' && attrs.type) this.diag.count(this.id, `notice ${String(attrs.type).slice(0, 30)}`)
+    // Account notices ("mex"). The restriction notice is recorded as the server
+    // sent it, because the library replaces kinds it does not know with DEFAULT.
+    if (tag === 'notification' && attrs.type === 'mex' && Array.isArray(content)) {
+      const up = content.find((c) => c?.tag === 'update')
+      const op = up?.attrs?.op_name
+      if (op) this.diag.count(this.id, `mex ${String(op).slice(0, 50)}`)
+      if (op && /Timelock|Capping/i.test(op)) {
+        let raw = ''
+        try {
+          raw = Buffer.from(up.content).toString()
+        } catch {}
+        this.diag.log(this.id, 'account-notice', { op, raw: brief(raw) })
+      }
+    }
+    if (!KNOWN_TAGS.has(tag)) {
+      const n = (this.unknownTags.get(tag) || 0) + 1
+      this.unknownTags.set(tag, n)
+      if (n <= 5) {
+        const child = Array.isArray(content) ? content[0]?.tag : undefined
+        this.diag.log(this.id, 'unknown-stanza', { tag, keys: Object.keys(attrs).join(','), type: attrs.type, child })
+      }
+    }
+    // How many held items the server has for this device, by kind, and when it
+    // finished delivering them.
+    if (tag === 'ib' && Array.isArray(content)) {
+      for (const c of content) {
+        if (c?.tag === 'offline_preview' || c?.tag === 'offline') this.diag.log(this.id, c.tag, { ...c.attrs })
+        else if (c?.tag) this.diag.count(this.id, `ib ${String(c.tag).slice(0, 30)}`)
+      }
+    }
+  }
+
+  // Called when the phone screen turns on or the app window comes to the front:
+  // test the connection now. Alone, the library notices a dead connection only
+  // at its next 30-second tick, so the inbox could stay stale for half a minute
+  // after the phone wakes.
+  // A healthy connection answers the ping and nothing else happens. A new
+  // connection is made only when two pings in a row get no answer, or when the
+  // app was already disconnected and waiting to retry.
+  async wake() {
+    if (this.stopped) return
+    if (!this.sock && !this.starting && this.status === 'connecting') {
+      clearTimeout(this.timer)
+      this.diag.log(this.id, 'wake', { did: 'retry now' })
+      this.connect()
+      return
+    }
+    const sock = this.sock
+    if (!sock || this.status !== 'open' || this.probing) return
+    if (Date.now() - (this.lastFrameAt || 0) < 5000) return // the server spoke in the last 5 seconds
+    this.probing = true
+    try {
+      for (let i = 1; i <= 2; i++) {
+        if (await this.ping(sock, 4000)) {
+          this.diag.count(this.id, 'wake ping answered')
+          return
+        }
+        if (sock !== this.sock) return
+        this.diag.log(this.id, 'ping-miss', { n: i })
+      }
+      this.restart('no answer to 2 pings after wake')
+    } finally {
+      this.probing = false
+    }
+  }
+
+  async ping(sock, ms) {
+    try {
+      const res = await sock.query(
+        { tag: 'iq', attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'w:p' }, content: [{ tag: 'ping', attrs: {} }] },
+        ms
+      )
+      return !!res
+    } catch {
+      return false
+    }
+  }
+
+  // Replace a connection that no longer answers. Events of the old socket are
+  // ignored from here on (onConnection compares with this.sock).
+  restart(reason) {
+    const old = this.sock
+    if (!old) return
+    this.diag.log(this.id, 'restart', { reason })
+    this.sock = null
+    Promise.resolve()
+      .then(() => old.end(new Error(reason)))
+      .catch(() => {})
+    this.set({ status: 'connecting', qr: null })
+    clearTimeout(this.timer)
+    this.timer = setTimeout(() => this.connect(), 500)
+  }
+
+  // WhatsApp now sends contacts' status posts ("stories") as a top-level <status>
+  // stanza. Baileys 7.0.0-rc14 has no handler for it and never answers. The server
+  // then holds back new messages for this device and closes the connection about
+  // 50 minutes later (WhiskeySockets/Baileys#2858). This app does not show status
+  // posts, so it answers each one with a plain ack, as whatsmeow does.
+  ackStatus(sock, node) {
+    const a = node?.attrs || {}
+    if (!a.id || !a.from) return
+    const attrs = { id: a.id, to: a.from, class: 'status' }
+    if (a.participant) attrs.participant = a.participant
+    if (a.recipient) attrs.recipient = a.recipient
+    if (a.type) attrs.type = a.type
+    this.diag.count(this.id, 'status acked')
+    sock.sendNode({ tag: 'ack', attrs }).catch((e) => {
+      this.diag.log(this.id, 'status-ack-failed', { err: String(e?.message || e).slice(0, 80) })
+    })
   }
 
   async onMessageUpdate({ key, update }) {
     if (!key?.remoteJid || !key.id || !update || skipJid(key.remoteJid)) return
     const chatId = await this.canon(key.remoteJid, key.remoteJidAlt)
+    // "Read" (4) or "played" (5) for a message the other person sent can only come
+    // from the user's own devices: the chat was read somewhere else.
+    if (update.status === 4 || update.status === 5) this.readElsewhere(chatId, key.id)
     if (update.message === null) {
       this.hub.ingest(this.id, { kind: 'revoke', chatId, targetId: key.id }, { live: true })
     } else if (update.message?.editedMessage?.message) {
@@ -569,6 +787,22 @@ export class WaAccount {
         this.hub.ingest(this.id, { kind: 'edit', chatId, targetId: key.id, text: p.text }, { live: true })
       }
     }
+  }
+
+  isMe(sock, jid) {
+    if (!jid) return false
+    const user = (j) => String(j || '').split('@')[0].split(':')[0]
+    const u = user(jid)
+    return !!u && (u === user(sock.user?.id) || u === user(sock.user?.lid))
+  }
+
+  // A read receipt arrived for a message stored here. When that message came
+  // from the other person, the user read the chat on another device.
+  readElsewhere(chatId, msgId) {
+    const row = this.store.getMessage(this.id, chatId, msgId)
+    if (!row || row.from_me) return
+    this.diag.count(this.id, 'read on another device')
+    this.hub.readElsewhere(this.id, chatId, row.ts)
   }
 
   jidFor(chatId) {
@@ -628,10 +862,17 @@ export class WaAccount {
     const last = this.store.lastMessage(this.id, chatId)
     if (!last?.raw) return
     const { key, messageTimestamp } = fromRaw(last.raw)
-    await this.sock.chatModify(
-      { archive: archived, lastMessages: [{ key, messageTimestamp }] },
-      this.jidFor(chatId)
-    )
+    const jid = this.jidFor(chatId)
+    // Recorded with its result: this is the only change this app writes into
+    // WhatsApp's own synced settings, and the time helps explain a later unlink.
+    const kind = jid.endsWith('@g.us') ? 'group' : jid.endsWith('@lid') ? 'lid' : 'pn'
+    try {
+      await this.sock.chatModify({ archive: archived, lastMessages: [{ key, messageTimestamp }] }, jid)
+      this.diag.log(this.id, 'archive-push', { archived: !!archived, jid: kind, ok: true })
+    } catch (e) {
+      this.diag.log(this.id, 'archive-push', { archived: !!archived, jid: kind, ok: false, err: String(e?.message || e).slice(0, 80) })
+      throw e
+    }
   }
 
   async pushRead(chatId, count) {

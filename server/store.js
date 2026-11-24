@@ -70,6 +70,13 @@ export async function openStore(file) {
       db.exec(`ALTER TABLE chats ADD COLUMN ${col}`)
     } catch {}
   }
+  // seen_ts: time of the newest message the user has already dealt with in the chat
+  // (read, answered or archived). A message WhatsApp delivers late counts as new
+  // only when it is newer than this. Starts at the last message already stored.
+  try {
+    db.exec('ALTER TABLE chats ADD COLUMN seen_ts INTEGER NOT NULL DEFAULT 0')
+    db.exec('UPDATE chats SET seen_ts = last_ts')
+  } catch {}
   // Colunas para sincronizar notas entre aparelhos: uid é o mesmo em todos os
   // aparelhos, mtime é a hora da última edição em milissegundos e deleted marca
   // uma nota apagada (fica guardada para o outro aparelho também apagar).
@@ -127,7 +134,7 @@ export async function openStore(file) {
 
   const allowed = new Set([
     'send_jid', 'name', 'is_group', 'archived', 'unread', 'last_ts', 'last_text', 'last_from_me',
-    'avatar', 'avatar_checked',
+    'avatar', 'avatar_checked', 'seen_ts',
   ])
 
   // Notas antigas guardavam só uma lista de tarefas. Viram texto com lista de tarefas.
@@ -209,6 +216,14 @@ export async function openStore(file) {
 
     lastMessage(account, chatId) {
       return q.lastMessage.get(account, chatId) || null
+    },
+
+    // Incoming messages newer than a time: what is still unread after the user
+    // read up to that time on another device.
+    countIncomingAfter(account, chatId, ts) {
+      return db
+        .prepare('SELECT count(*) AS n FROM messages WHERE account = ? AND chat_id = ? AND from_me = 0 AND ts > ?')
+        .get(account, chatId, ts).n
     },
 
     recentIncomingRaw(account, chatId, limit) {
@@ -360,6 +375,7 @@ export async function openStore(file) {
         last_ts: newer.last_ts,
         last_text: newer.last_text,
         last_from_me: newer.last_from_me,
+        seen_ts: Math.max(a.seen_ts || 0, b.seen_ts || 0),
       })
       db.prepare('DELETE FROM chats WHERE account = ? AND id = ?').run(account, from)
       return true
