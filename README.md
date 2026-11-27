@@ -120,8 +120,20 @@ To answer and make calls, open **Accounts > Calls** for a number and scan the QR
 
 The Mac and the phone send their notes to each other every 30 seconds and right after each edit. When the same note was edited on both, the most recent edit wins. Deleting a note on one device deletes it on the other.
 
-- Both devices must be on the same [Tailscale](https://tailscale.com) network. The sync port (4318) only answers devices on that network that know the pairing code.
+- Both devices must be on the same [Tailscale](https://tailscale.com) network. The sync port (4318) only answers requests that come from an address in the range Tailscale uses (100.64.0.0 to 100.127.255.255) and that carry the pairing code.
 - To pair: on one device open **Accounts**, copy the code under **Notes sync**, and type it under **Notes sync** on the other device.
+
+### Checking the phone from the Mac
+
+Each app keeps an event recorder: a log of its WhatsApp connections (each open and close with the reason, counts of what arrived). It is written to hold no message text and no phone number, and a long run of digits is replaced before a line is saved. `GET /api/diag` on the local server returns it.
+
+Paired devices can read each other's recorder over the same link as the notes, with the same two checks. `GET /api/diag/peers` on the Mac returns the phone's recorder and, for each account on the phone and on the Mac:
+
+- whether it is connected;
+- the time written on its newest stored message. When the phone's time is more than a minute older than the Mac's for the same number, the phone has not stored the newest message. An equal time does not say when the message arrived, because a message delivered late keeps its own time;
+- a short code that is the same on both devices for the same number, so the two entries can be matched. The number itself is not sent.
+
+Reading the report writes nothing on the other device.
 
 ## Shortcuts
 
@@ -140,7 +152,8 @@ The Mac and the phone send their notes to each other every 30 seconds and right 
 | Folder | What is inside |
 | --- | --- |
 | `electron/` | The Mac window and the app menu. |
-| `server/` | The local server: WhatsApp connection (`wa.js`), the archive rules (`hub.js`), the SQLite database (`store.js`, `sqlite.js`), note sync (`sync.js`), voice message conversion (`ogg.js`) and the demo data (`demo.js`). |
+| `server/` | The local server: WhatsApp connection (`wa.js`), the archive rules (`hub.js`), the SQLite database (`store.js`, `sqlite.js`), note sync (`sync.js`), the event recorder (`diag.js`), voice message conversion (`ogg.js`) and the demo data (`demo.js`). |
+| `test/` | Tests. Run them with `npm test` (Tailscale must be on). |
 | `android/` | The Android app: the window, the background service with notifications, and the bridge that starts Node. |
 | `ui/` | The interface: plain HTML, CSS and JavaScript, no framework. |
 | `build/` | The app icon and the logo options. |

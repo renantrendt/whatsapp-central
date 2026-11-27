@@ -40,7 +40,7 @@ if (process.env.WC_MOBILE) {
 import { openStore } from './store.js'
 import { createHub, previewOf } from './hub.js'
 import { startSync } from './sync.js'
-import { createDiag, noDiag } from './diag.js'
+import { createDiag, noDiag, accountState } from './diag.js'
 import { webmToOgg } from './ogg.js'
 import { EventEmitter } from 'node:events'
 
@@ -64,7 +64,9 @@ if (process.env.WC_MOBILE) {
 }
 const hub = createHub(store)
 // Sincronização das notas com o outro aparelho (não roda no modo de demonstração).
-const sync = demo ? null : startSync({ store, onNotesChanged: () => hub.events.emit('event', { type: 'notes' }) })
+const sync = demo
+  ? null
+  : startSync({ store, onNotesChanged: () => hub.events.emit('event', { type: 'notes' }), report: (n) => selfReport(n) })
 // No Android o app passa o segredo por WC_TOKEN, para o serviço de avisos também ler os eventos.
 const token = /^[a-f0-9]{32,}$/.test(process.env.WC_TOKEN || '')
   ? process.env.WC_TOKEN
@@ -74,6 +76,38 @@ const digits = (v) => (v == null ? undefined : String(v).replace(/\D/g, ''))
 const accounts = new Map()
 const accountViews = () => [...accounts.values()].map((a) => a.view())
 const onChange = () => hub.accountsChanged(accountViews())
+
+// How this device's WhatsApp connections are doing: each account's state, with
+// no phone number and no message text (see accountState in diag.js). A paired
+// device reads it over the notes link (route /sync/diag in sync.js), and
+// /api/diag/peers shows both sides.
+// - startedAt is the clock time when this process started.
+// - upSec is the process's own count of running time. It can be shorter than
+//   now - startedAt when the device slept.
+// - starting is true until the accounts are loaded. Until then the account
+//   list is not final: an empty list does not mean "no number on this device".
+const bootAt = Date.now()
+let started = false // true once the accounts are loaded
+const newestChat = store.db.prepare('SELECT max(last_ts) AS t FROM chats WHERE account = ?')
+function selfState() {
+  const secret = store.getSetting('sync_secret')
+  return {
+    now: Date.now(),
+    startedAt: bootAt,
+    upSec: Math.round(process.uptime()),
+    mobile: !!process.env.WC_MOBILE,
+    starting: !started,
+    accounts: [...accounts.values()].map((a) =>
+      accountState(a, { newestChat: newestChat.get(a.id)?.t, number: store.getSetting(`num:${a.id}`), secret })
+    ),
+  }
+}
+// The report for a paired device: the state above, the recorder's last n lines
+// and its counters not yet written. Reading it writes nothing to the recorder.
+// It is served during start-up too: when a start fails, its lines say why.
+function selfReport(n) {
+  return { ...selfState(), pending: diag.pending(), lines: diag.tail(n) }
+}
 
 let WaAccount = null
 if (demo) {
@@ -223,6 +257,7 @@ for (const a of [...accounts.values()]) {
     accounts.delete(a.id)
   }
 }
+started = true
 
 function wantAvatars(chats) {
   let archived = 0
@@ -377,6 +412,13 @@ const server = http.createServer(async (req, res) => {
       diag.flush()
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
       return res.end(`${diag.tail(Number(arg('n')) || 800).join('\n')}\n`)
+    }
+
+    // The same recorder on each paired device (the phone, seen from the Mac),
+    // with each account's state there and here. See selfState above.
+    if (req.method === 'GET' && p === '/api/diag/peers') {
+      const peers = sync ? await sync.peerReports(Number(arg('n')) || 800) : []
+      return json(res, 200, { here: selfState(), peers })
     }
 
     if (req.method === 'GET' && p === '/api/notes') {

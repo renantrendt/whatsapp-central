@@ -5,9 +5,14 @@
 // pareamento. A cada 30 segundos, e logo depois de cada edição, o app manda
 // todas as suas notas para o outro aparelho e recebe as dele de volta. Cada
 // lado guarda a versão mais recente de cada nota.
+//
+// The same port also answers /sync/diag: a paired device asks how this
+// device's WhatsApp connections are doing. The Mac uses it to read the phone's
+// event recorder (see diag.js) without a cable. Same two checks as the notes.
 import http from 'node:http'
 import os from 'node:os'
 import crypto from 'node:crypto'
+import { cleanReport } from './diag.js'
 
 export const SYNC_PORT = Number(process.env.WC_SYNC_PORT || 4318)
 
@@ -55,7 +60,17 @@ function readJson(req, limit = 30_000_000) {
   })
 }
 
-export function startSync({ store, onNotesChanged }) {
+const REPORT_MAX = 8_000_000 // bytes; a full recorder is about 2 MB
+
+// A real report holds one object per recorder line (6,000 at most) and a few
+// more. An answer with more opening brackets than this is not parsed: millions
+// of nested or empty objects fit in 8 MB and cost hundreds of MB to parse.
+const REPORT_BRACKETS = 100_000
+
+// report(n) returns this device's connection report with the last n recorder
+// lines. Without it, /sync/diag answers 404. reportWaitMs is how long this
+// device waits for another device's report.
+export function startSync({ store, onNotesChanged, report, reportWaitMs = 15000 }) {
   const state = { lastSync: 0, error: null, listening: false }
   if (!store.getSetting('sync_secret')) store.setSetting('sync_secret', randomCode())
   const secret = () => store.getSetting('sync_secret')
@@ -97,6 +112,9 @@ export function startSync({ store, onNotesChanged }) {
         state.error = null
         return reply(200, { notes: store.exportNotes() })
       }
+      if (req.url === '/sync/diag' && report) {
+        return reply(200, report(Number(body.n) || 800))
+      }
       reply(404, {})
     } catch (e) {
       reply(500, { error: e.message })
@@ -112,11 +130,57 @@ export function startSync({ store, onNotesChanged }) {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-wc-sync': key },
       body: JSON.stringify(payload),
+      // A redirect is never followed: the request, with the secret and the
+      // notes in it, would be repeated to the address the answer names.
+      redirect: 'manual',
       signal: AbortSignal.timeout(15000),
     })
     const data = await r.json().catch(() => ({}))
     if (!r.ok) throw new Error(data.error || `answer ${r.status}`)
     return data
+  }
+
+  // Asks one device for its report. Each failure has its own reason. The answer
+  // is read piece by piece, to stop at the size limit, and then rebuilt field
+  // by field (cleanReport), so the result has the report's fields and limits
+  // whatever was sent.
+  async function askReport(peer, n) {
+    const res = await fetch(`http://${peer}/sync/diag`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-wc-sync': secret() },
+      body: JSON.stringify({ n }),
+      redirect: 'manual', // see post() above
+      signal: AbortSignal.timeout(reportWaitMs),
+    })
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {})
+      if (res.status === 404) throw new Error('The app on that device is an older version. It cannot send its report.')
+      if (res.status === 403) throw new Error('That device refused the request (answer 403). Pair the two devices again.')
+      throw new Error(`That device answered ${res.status}.`)
+    }
+    if (!res.body) throw new Error('The answer is not a report.')
+    const parts = []
+    let size = 0
+    let brackets = 0
+    const reader = res.body.getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      size += value.length
+      for (let i = 0; i < value.length; i++) if (value[i] === 0x7b || value[i] === 0x5b) brackets++
+      if (size > REPORT_MAX || brackets > REPORT_BRACKETS) {
+        await reader.cancel().catch(() => {})
+        if (size > REPORT_MAX) throw new Error('The answer is larger than 8 MB. It was not read.')
+        throw new Error('The answer holds more objects than a report can. It was not read.')
+      }
+      parts.push(value)
+    }
+    let data = null
+    try {
+      data = JSON.parse(Buffer.concat(parts).toString('utf8'))
+    } catch {}
+    if (!data || !Array.isArray(data.lines)) throw new Error('The answer is not a report.')
+    return cleanReport(data)
   }
 
   let running = false
@@ -157,10 +221,30 @@ export function startSync({ store, onNotesChanged }) {
       }
     },
     changed: soon,
+    // Asks each paired device for its connection report (route /sync/diag), all
+    // at the same time. One entry per device: the report, or `error` with the
+    // reason when the device gave none. It answers within reportWaitMs.
+    peerReports(n) {
+      const reach = 'Is Tailscale on and the app open there?'
+      return Promise.all(
+        peers().map(async (peer) => {
+          try {
+            return { ...(await askReport(peer, n)), peer }
+          } catch (e) {
+            if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+              return { peer, error: `No complete answer in ${reportWaitMs / 1000} seconds. ${reach}` }
+            }
+            // "fetch failed" alone says nothing: the cause holds ECONNREFUSED, EHOSTUNREACH and so on.
+            if (e.cause) return { peer, error: `The connection failed (${e.cause.code || e.cause.message || e.message}). ${reach}` }
+            return { peer, error: e.message }
+          }
+        })
+      )
+    },
     // Pareia com o código mostrado no outro aparelho: "100.x.y.z/SEGREDO".
     async pair(code) {
       const m = /^\s*(100\.\d+\.\d+\.\d+)(?::(\d+))?\s*\/\s*([A-Z0-9]{8,})\s*$/i.exec(code || '')
-      if (!m) throw new Error('The code looks like 100.101.150.56/ABCD2345EFGH.')
+      if (!m) throw new Error('The code looks like 100.64.0.1/ABCD2345EFGH.')
       const peer = `${m[1]}:${m[2] || SYNC_PORT}`
       const key = m[3].toUpperCase()
       const { notes } = await post(peer, '/sync/pair', { port: SYNC_PORT, notes: store.exportNotes() }, key)

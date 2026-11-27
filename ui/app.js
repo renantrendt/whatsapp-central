@@ -260,7 +260,7 @@ async function renderSync(box) {
   }
   box.append(el('p', null, 'Or type the code shown on the other device:'))
   const input = el('input', 'phone-input')
-  input.placeholder = '100.101.150.56/ABCD2345EFGH'
+  input.placeholder = '100.64.0.1/ABCD2345EFGH'
   input.autocapitalize = 'characters'
   input.spellcheck = false
   const go = el('button', 'primary', 'Pair')
